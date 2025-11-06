@@ -46,6 +46,9 @@ Repository = "https://github.com/your-org/ms365-email-mcp-server"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatchling.build]
+packages = ["ms365_email_mcp_server"]
+
 [tool.uv]
 dev-dependencies = [
     "pytest>=7.0.0",

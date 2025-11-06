@@ -58,7 +58,11 @@ MS365_CLIENT_SECRET=your-azure-ad-client-secret
 MS365_TENANT_ID=your-tenant-id
 # Optional: For Government Cloud
 MS365_CLOUD_TYPE=gov  # Options: "commercial" (default), "gov", "government", "usgov"
+# Optional: For shared mailboxes (required for Client Credentials Flow)
+MS365_USER_IDENTIFIER=user@domain.com  # UserPrincipalName or Graph ID of the shared mailbox
 ```
+
+**Important for Shared Mailboxes**: When using Client Credentials Flow (app-only authentication), you **must** provide `MS365_USER_IDENTIFIER` because `/me/` endpoints don't work without a signed-in user. Use the UserPrincipalName (e.g., `shared-mailbox@domain.com`) or the Graph ID of the shared mailbox.
 
 ## Local Development
 

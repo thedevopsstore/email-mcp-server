@@ -25,6 +25,25 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8100"))
 STATELESS_HTTP = os.getenv("STATELESS_HTTP", "true").lower() == "true"
 
+# Transport configuration (matching AWS API MCP server pattern)
+# Reference: https://github.com/awslabs/mcp/blob/main/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/core/common/config.py#L67
+def get_transport_from_env() -> tuple[str, str]:
+    """
+    Get transport value from environment variable, with validation.
+    Returns (env_value, fastmcp_value) tuple.
+    - env_value: 'stdio' or 'streamable-http' (matches AWS API MCP server)
+    - fastmcp_value: 'stdio' or 'http' (what FastMCP expects)
+    """
+    transport = os.getenv("TRANSPORT", "streamable-http").lower()
+    if transport not in ["stdio", "streamable-http"]:
+        raise ValueError(f"Invalid transport: {transport}. Must be 'stdio' or 'streamable-http'")
+    
+    # Map 'streamable-http' to 'http' for FastMCP
+    fastmcp_transport = "http" if transport == "streamable-http" else transport
+    return transport, fastmcp_transport
+
+TRANSPORT_ENV, TRANSPORT = get_transport_from_env()
+
 # Initialize FastMCP server
 server = FastMCP(
     name="MS365-Email-MCP",
@@ -40,12 +59,18 @@ class MS365EmailClient:
     Microsoft 365 Email API client using Client Credentials Flow.
     
     Reference: https://learn.microsoft.com/en-us/graph/auth-v2-service?tabs=http
+    
+    For shared mailboxes or app-only authentication, use user_identifier
+    (UserPrincipalName or Graph ID) instead of /me/ endpoints.
     """
     
-    def __init__(self):
+    def __init__(self, user_identifier: Optional[str] = None):
         self.client_id = os.getenv("MS365_CLIENT_ID")
         self.client_secret = os.getenv("MS365_CLIENT_SECRET")
         self.tenant_id = os.getenv("MS365_TENANT_ID")
+        # User identifier for shared mailboxes (UserPrincipalName or Graph ID)
+        # If not provided, defaults to /me/ (requires delegated permissions)
+        self.user_identifier = user_identifier or os.getenv("MS365_USER_IDENTIFIER")
         
         # Determine cloud type (commercial or gov)
         cloud_type = os.getenv("MS365_CLOUD_TYPE", "commercial").lower()
@@ -94,6 +119,12 @@ class MS365EmailClient:
             logger.error(f"Failed to acquire token: {error}")
             raise Exception(f"Failed to acquire token: {error}")
     
+    def _get_user_prefix(self) -> str:
+        """Get the user prefix for endpoints (/me/ or /users/{id}/)."""
+        if self.user_identifier:
+            return f"users/{self.user_identifier}"
+        return "me"
+    
     async def _make_request(
         self, method: str, endpoint: str, **kwargs
     ) -> Any:
@@ -103,6 +134,12 @@ class MS365EmailClient:
         Reference: https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1.0&tabs=http
         """
         token = self.get_access_token()
+        
+        # Replace /me/ with user-specific endpoint if user_identifier is set
+        if self.user_identifier and endpoint.startswith("me/"):
+            endpoint = endpoint.replace("me/", f"users/{self.user_identifier}/", 1)
+        elif self.user_identifier and "/me/" in endpoint:
+            endpoint = endpoint.replace("/me/", f"/users/{self.user_identifier}/")
         
         # Ensure endpoint starts with /v1.0 or /beta
         if not endpoint.startswith("/v1.0") and not endpoint.startswith("/beta"):
@@ -205,11 +242,21 @@ class MS365EmailClient:
 _ms365_client: Optional[MS365EmailClient] = None
 
 
-def get_client() -> MS365EmailClient:
-    """Get or create MS365 email client."""
+def get_client(user_identifier: Optional[str] = None) -> MS365EmailClient:
+    """
+    Get or create MS365 email client.
+    
+    Args:
+        user_identifier: Optional UserPrincipalName or Graph ID for shared mailboxes.
+                        If not provided, uses MS365_USER_IDENTIFIER env var or /me/ endpoints.
+    """
     global _ms365_client
-    if _ms365_client is None:
-        _ms365_client = MS365EmailClient()
+    # Use provided user_identifier or environment variable
+    effective_user_id = user_identifier or os.getenv("MS365_USER_IDENTIFIER")
+    
+    # Create new client if user_identifier changed or client doesn't exist
+    if _ms365_client is None or _ms365_client.user_identifier != effective_user_id:
+        _ms365_client = MS365EmailClient(user_identifier=effective_user_id)
     return _ms365_client
 
 
@@ -335,7 +382,7 @@ async def get_mail_message(
 
 @server.tool(
     name="send-mail",
-    description="Send an email to a recipient. The email will be sent immediately and saved to sent items.",
+    description="Send an email to a recipient. The email will be sent immediately and saved to sent items. For shared mailboxes, provide user_identifier (UserPrincipalName or Graph ID).",
     annotations=ToolAnnotations(
         title="Send email",
         readOnlyHint=False,
@@ -360,6 +407,10 @@ async def send_mail(
         str,
         Field(description="Body content type: 'HTML' or 'Text' (default: 'HTML')")
     ] = "HTML",
+    user_identifier: Annotated[
+        Optional[str],
+        Field(description="Optional: UserPrincipalName or Graph ID for shared mailboxes. If not provided, uses MS365_USER_IDENTIFIER env var or /me/ endpoint.")
+    ] = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Send an email."""
@@ -367,7 +418,7 @@ async def send_mail(
         if body_type not in ["HTML", "Text"]:
             raise ValueError("body_type must be 'HTML' or 'Text'")
         
-        client = get_client()
+        client = get_client(user_identifier=user_identifier)
         result = await client.send_mail(to, subject, body, body_type)
         return {"success": True, "result": result}
     except Exception as e:
@@ -502,10 +553,12 @@ def main():
         raise ValueError(error_message)
     
     logger.info(f"Starting MS365 Email MCP Server on {HOST}:{PORT}")
+    logger.info(f"Transport: {TRANSPORT_ENV}")
     logger.info(f"Stateless HTTP: {STATELESS_HTTP}")
     
-    # Run the server
-    server.run()
+    # Run the server with explicit transport
+    # TRANSPORT is mapped to FastMCP's expected values ('stdio' or 'http')
+    server.run(transport=TRANSPORT)
 
 
 if __name__ == "__main__":

@@ -5,14 +5,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-# Copy dependency files
-COPY pyproject.toml ./
-
-# Install dependencies using UV
-RUN uv pip install --system -e .
-
-# Copy application code
+# Copy all files needed for installation
+COPY pyproject.toml README.md ./
 COPY ms365_email_mcp_server ./ms365_email_mcp_server
+
+# Install dependencies and package using UV
+RUN uv pip install --system -e .
 
 # Expose port
 EXPOSE 8100
