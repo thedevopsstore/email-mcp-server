@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  email-mcp-server:
+    build: .
+    ports:
+      - "8100:8100"
+    environment:
+      - MS365_CLIENT_ID=${MS365_CLIENT_ID}
+      - MS365_CLIENT_SECRET=${MS365_CLIENT_SECRET}
+      - MS365_TENANT_ID=${MS365_TENANT_ID}
+      - MS365_CLOUD_TYPE=${MS365_CLOUD_TYPE:-commercial}
+      - PORT=8100
+      - HOST=0.0.0.0
+    restart: unless-stopped
+
