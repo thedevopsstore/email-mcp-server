@@ -544,7 +544,7 @@ def main():
     
     # Run the server with explicit transport
     # TRANSPORT is mapped to FastMCP's expected values ('stdio' or 'http')
-    server.run(transport=TRANSPORT)
+    server.run(transport=TRANSPORT_ENV)
 
 
 if __name__ == "__main__":
