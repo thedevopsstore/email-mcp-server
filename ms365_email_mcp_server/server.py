@@ -27,8 +27,7 @@ STATELESS_HTTP = os.getenv("STATELESS_HTTP", "true").lower() == "true"
 
 # Transport configuration - hardcoded to streamable-http
 # Reference: https://github.com/awslabs/mcp/blob/main/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/core/common/config.py#L67
-TRANSPORT_ENV = "streamable-http"  # Environment value (for logging)
-TRANSPORT = "http"  # FastMCP expects 'http' for streamable-http transport
+TRANSPORT = "streamable-http"  # FastMCP expects 'streamable-http' for HTTP/SSE transport
 
 # Initialize FastMCP server
 server = FastMCP(
@@ -112,12 +111,18 @@ class MS365EmailClient:
         return "me"
     
     async def _make_request(
-        self, method: str, endpoint: str, **kwargs
+        self, method: str, endpoint: str, return_json: bool = True, **kwargs
     ) -> Any:
         """
         Make authenticated request to Microsoft Graph API.
         
         Reference: https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1.0&tabs=http
+        
+        Args:
+            method: HTTP method (GET, POST, DELETE, etc.)
+            endpoint: API endpoint (e.g., "me/sendMail", "me/messages")
+            return_json: Whether to parse JSON response (default: True)
+                        Set to False for endpoints that return empty body (e.g., sendMail returns 202)
         """
         token = self.get_access_token()
         
@@ -141,6 +146,17 @@ class MS365EmailClient:
         async with httpx.AsyncClient() as client:
             response = await client.request(method, url, headers=headers, **kwargs)
             response.raise_for_status()
+            
+            # Some endpoints (like sendMail) return 202 Accepted with empty body
+            # Reference: https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0&tabs=http
+            if not return_json or response.status_code == 202:
+                return {"status": response.status_code, "status_text": response.reason_phrase}
+            
+            # Try to parse JSON, but handle empty responses gracefully
+            text = response.text.strip()
+            if not text:
+                return {"status": response.status_code, "status_text": response.reason_phrase}
+            
             return response.json()
     
     async def list_mail_messages(
@@ -183,7 +199,9 @@ class MS365EmailClient:
         """
         Send an email.
         
-        Reference: https://learn.microsoft.com/en-us/graph/api/user-post-messages?view=graph-rest-1.0&tabs=http
+        Reference: https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0&tabs=http
+        
+        Returns 202 Accepted with empty body - the message is queued for delivery.
         """
         payload = {
             "message": {
@@ -196,11 +214,13 @@ class MS365EmailClient:
             },
             "saveToSentItems": "true"
         }
-        return await self._make_request("POST", "me/sendMail", json=payload)
+        # sendMail returns 202 Accepted with no response body
+        return await self._make_request("POST", "me/sendMail", return_json=False, json=payload)
     
-    async def delete_mail_message(self, message_id: str) -> None:
-        """Delete a mail message."""
-        await self._make_request("DELETE", f"me/messages/{message_id}")
+    async def delete_mail_message(self, message_id: str) -> dict:
+        """Delete a mail message. Returns 204 No Content with empty body."""
+        # DELETE returns 204 No Content with no response body
+        return await self._make_request("DELETE", f"me/messages/{message_id}", return_json=False)
     
     async def create_draft_email(
         self, to: str, subject: str, body: str, body_type: str = "HTML"
@@ -435,8 +455,8 @@ async def delete_mail_message(
     """Delete a mail message."""
     try:
         client = get_client()
-        await client.delete_mail_message(message_id)
-        return {"success": True, "message": "Message deleted successfully"}
+        result = await client.delete_mail_message(message_id)
+        return {"success": True, "message": "Message deleted successfully", "result": result}
     except Exception as e:
         error_message = f"Error deleting mail message: {str(e)}"
         logger.error(error_message)
@@ -539,12 +559,12 @@ def main():
         raise ValueError(error_message)
     
     logger.info(f"Starting MS365 Email MCP Server on {HOST}:{PORT}")
-    logger.info(f"Transport: {TRANSPORT_ENV}")
+    logger.info(f"Transport: {TRANSPORT}")
     logger.info(f"Stateless HTTP: {STATELESS_HTTP}")
     
     # Run the server with explicit transport
-    # TRANSPORT is mapped to FastMCP's expected values ('stdio' or 'http')
-    server.run(transport=TRANSPORT_ENV)
+    # TRANSPORT: 'stdio' or 'streamable-http' (FastMCP accepts these values)
+    server.run(transport=TRANSPORT)
 
 
 if __name__ == "__main__":
