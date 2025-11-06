@@ -25,24 +25,10 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8100"))
 STATELESS_HTTP = os.getenv("STATELESS_HTTP", "true").lower() == "true"
 
-# Transport configuration (matching AWS API MCP server pattern)
+# Transport configuration - hardcoded to streamable-http
 # Reference: https://github.com/awslabs/mcp/blob/main/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/core/common/config.py#L67
-def get_transport_from_env() -> tuple[str, str]:
-    """
-    Get transport value from environment variable, with validation.
-    Returns (env_value, fastmcp_value) tuple.
-    - env_value: 'stdio' or 'streamable-http' (matches AWS API MCP server)
-    - fastmcp_value: 'stdio' or 'http' (what FastMCP expects)
-    """
-    transport = os.getenv("TRANSPORT", "streamable-http").lower()
-    if transport not in ["stdio", "streamable-http"]:
-        raise ValueError(f"Invalid transport: {transport}. Must be 'stdio' or 'streamable-http'")
-    
-    # Map 'streamable-http' to 'http' for FastMCP
-    fastmcp_transport = "http" if transport == "streamable-http" else transport
-    return transport, fastmcp_transport
-
-TRANSPORT_ENV, TRANSPORT = get_transport_from_env()
+TRANSPORT_ENV = "streamable-http"  # Environment value (for logging)
+TRANSPORT = "http"  # FastMCP expects 'http' for streamable-http transport
 
 # Initialize FastMCP server
 server = FastMCP(
