@@ -81,7 +81,6 @@ class MS365EmailClient:
             authority=self.authority,
             client_credential=self.client_secret
         )
-        self._access_token: Optional[str] = None
     
     def get_access_token(self) -> str:
         """
@@ -89,16 +88,16 @@ class MS365EmailClient:
         
         Reference: https://learn.microsoft.com/en-us/graph/auth-v2-service?tabs=http#step-3-request-an-access-token
         """
-        if self._access_token:
-            return self._access_token
-        
-        # Acquire token for client (app-only authentication)
-        result = self.app.acquire_token_for_client(scopes=self.scope)
-        
+        # MSAL caches client credential tokens inside the application instance.
+        # Try silent acquisition first before requesting a new token.
+        result = self.app.acquire_token_silent(self.scope, account=None)
+
+        if not result:
+            result = self.app.acquire_token_for_client(scopes=self.scope)
+
         if "access_token" in result:
-            self._access_token = result["access_token"]
-            logger.info("Access token acquired successfully")
-            return self._access_token
+            logger.info("Access token acquired successfully (MSAL cache hit=%s)", bool(result.get("token_source") == "cache"))
+            return result["access_token"]
         else:
             error = result.get("error_description", result.get("error", "Unknown error"))
             logger.error(f"Failed to acquire token: {error}")
@@ -124,40 +123,57 @@ class MS365EmailClient:
             return_json: Whether to parse JSON response (default: True)
                         Set to False for endpoints that return empty body (e.g., sendMail returns 202)
         """
-        token = self.get_access_token()
-        
         # Replace /me/ with user-specific endpoint if user_identifier is set
         if self.user_identifier and endpoint.startswith("me/"):
             endpoint = endpoint.replace("me/", f"users/{self.user_identifier}/", 1)
         elif self.user_identifier and "/me/" in endpoint:
             endpoint = endpoint.replace("/me/", f"/users/{self.user_identifier}/")
-        
+
         # Ensure endpoint starts with /v1.0 or /beta
         if not endpoint.startswith("/v1.0") and not endpoint.startswith("/beta"):
             endpoint = f"/v1.0/{endpoint.lstrip('/')}"
-        
+
         url = f"{self.graph_base}{endpoint}"
-        
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.request(method, url, headers=headers, **kwargs)
+
+        last_response: Optional[httpx.Response] = None
+
+        for attempt in range(2):
+            token = self.get_access_token()
+
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+
+            async with httpx.AsyncClient() as client:
+                response = await client.request(method, url, headers=headers, **kwargs)
+            last_response = response
+
+            if response.status_code == 401 and attempt == 0:
+                logger.warning("Access token expired or invalid. Refreshing token and retrying once...")
+                if self.app.token_cache:
+                    self.app.token_cache.clear()
+                continue
+
             response.raise_for_status()
-            
+
             # Some endpoints (like sendMail) return 202 Accepted with empty body
             # Reference: https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0&tabs=http
-            if not return_json or response.status_code == 202:
+            if not return_json or response.status_code in (202, 204):
                 return {"status": response.status_code, "status_text": response.reason_phrase}
-            
+
             # Try to parse JSON, but handle empty responses gracefully
             text = response.text.strip()
             if not text:
                 return {"status": response.status_code, "status_text": response.reason_phrase}
-            
+
             return response.json()
+
+        # If we exhausted retries, raise the last response error
+        if last_response is not None:
+            last_response.raise_for_status()
+
+        raise Exception("Request failed without a valid HTTP response")
     
     async def list_mail_messages(
         self, folder_id: Optional[str] = None, top: int = 25
