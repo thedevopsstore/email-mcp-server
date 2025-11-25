@@ -176,22 +176,34 @@ class MS365EmailClient:
         raise Exception("Request failed without a valid HTTP response")
     
     async def list_mail_messages(
-        self, folder_id: Optional[str] = None, top: int = 25
+        self, folder_id: Optional[str] = None, top: int = 25, unread_only: bool = True
     ) -> list:
         """
         List mail messages from inbox or a specific folder.
         
+        By default, only lists unread messages from the Inbox folder to avoid scanning
+        all folders (inbox, sent items, deleted items, etc.) and minimize token usage.
+        
         Reference: https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1.0&tabs=http
         """
+        # Default to Inbox folder to avoid scanning all folders
+        # Use well-known folder name "Inbox" which is supported by Microsoft Graph
         if folder_id:
             endpoint = f"me/mailFolders/{folder_id}/messages"
         else:
-            endpoint = "me/messages"
+            endpoint = "me/mailFolders/Inbox/messages"
         
+        # Use $select to reduce response size and improve performance
+        # Only fetch essential properties to minimize token usage
         params = {
             "$top": top,
-            "$orderby": "receivedDateTime desc"
+            "$orderby": "receivedDateTime desc",
+            "$select": "id,subject,sender,receivedDateTime,isRead,hasAttachments,bodyPreview"
         }
+        
+        # By default, filter to only unread messages to minimize token usage
+        if unread_only:
+            params["$filter"] = "isRead eq false"
         
         result = await self._make_request("GET", endpoint, params=params)
         return result.get("value", [])
@@ -201,9 +213,9 @@ class MS365EmailClient:
         result = await self._make_request("GET", "me/mailFolders")
         return result.get("value", [])
     
-    async def list_mail_folder_messages(self, folder_id: str, top: int = 25) -> list:
-        """List messages from a specific folder."""
-        return await self.list_mail_messages(folder_id=folder_id, top=top)
+    async def list_mail_folder_messages(self, folder_id: str, top: int = 25, unread_only: bool = True) -> list:
+        """List messages from a specific folder. By default, only returns unread messages."""
+        return await self.list_mail_messages(folder_id=folder_id, top=top, unread_only=unread_only)
     
     async def get_mail_message(self, message_id: str) -> dict:
         """Get a specific mail message by ID."""
@@ -284,7 +296,7 @@ def get_client(user_identifier: Optional[str] = None) -> MS365EmailClient:
 
 @server.tool(
     name="list-mail-messages",
-    description="List mail messages from inbox or a specific folder. Returns a list of messages with their details including subject, sender, received date, and message ID.",
+    description="List mail messages from inbox or a specific folder. By default, only lists unread messages from the Inbox folder (not sent items or other folders) to minimize token usage. Returns a list of messages with their details including subject, sender, received date, and message ID.",
     annotations=ToolAnnotations(
         title="List mail messages",
         readOnlyHint=True,
@@ -294,18 +306,22 @@ def get_client(user_identifier: Optional[str] = None) -> MS365EmailClient:
 async def list_mail_messages(
     folder_id: Annotated[
         Optional[str],
-        Field(description="Optional folder ID. If not provided, lists from inbox.")
+        Field(description="Optional folder ID or well-known folder name (e.g., 'Inbox', 'SentItems', 'Drafts'). If not provided, defaults to Inbox folder only.")
     ] = None,
     top: Annotated[
         int,
         Field(description="Number of messages to retrieve (default: 25)", ge=1, le=100)
     ] = 25,
+    unread_only: Annotated[
+        bool,
+        Field(description="If true, only return unread messages. If false, return all messages (read and unread). Default: true.")
+    ] = True,
     ctx: Context = None,
 ) -> dict[str, Any]:
-    """List mail messages from inbox or a specific folder."""
+    """List mail messages from inbox or a specific folder. Defaults to unread messages from Inbox only to avoid scanning all folders."""
     try:
         client = get_client()
-        messages = await client.list_mail_messages(folder_id=folder_id, top=top)
+        messages = await client.list_mail_messages(folder_id=folder_id, top=top, unread_only=unread_only)
         return {"messages": messages, "count": len(messages)}
     except Exception as e:
         error_message = f"Error listing mail messages: {str(e)}"
@@ -342,7 +358,7 @@ async def list_mail_folders(
 
 @server.tool(
     name="list-mail-folder-messages",
-    description="List messages from a specific folder by folder ID. Returns messages with their details.",
+    description="List messages from a specific folder by folder ID. By default, only returns unread messages to minimize token usage. Returns messages with their details.",
     annotations=ToolAnnotations(
         title="List folder messages",
         readOnlyHint=True,
@@ -358,12 +374,16 @@ async def list_mail_folder_messages(
         int,
         Field(description="Number of messages to retrieve (default: 25)", ge=1, le=100)
     ] = 25,
+    unread_only: Annotated[
+        bool,
+        Field(description="If true, only return unread messages. If false, return all messages (read and unread). Default: true.")
+    ] = True,
     ctx: Context = None,
 ) -> dict[str, Any]:
-    """List messages from a specific folder."""
+    """List messages from a specific folder. By default, only returns unread messages."""
     try:
         client = get_client()
-        messages = await client.list_mail_folder_messages(folder_id=folder_id, top=top)
+        messages = await client.list_mail_folder_messages(folder_id=folder_id, top=top, unread_only=unread_only)
         return {"messages": messages, "count": len(messages)}
     except Exception as e:
         error_message = f"Error listing folder messages: {str(e)}"
