@@ -217,9 +217,43 @@ class MS365EmailClient:
         """List messages from a specific folder. By default, only returns unread messages."""
         return await self.list_mail_messages(folder_id=folder_id, top=top, unread_only=unread_only)
     
-    async def get_mail_message(self, message_id: str) -> dict:
-        """Get a specific mail message by ID."""
-        return await self._make_request("GET", f"me/messages/{message_id}")
+    async def get_mail_message(self, message_id: str, mark_as_read: bool = True) -> dict:
+        """
+        Get a specific mail message by ID.
+        
+        By default, marks the message as read after retrieving it.
+        
+        Reference: https://learn.microsoft.com/en-us/graph/api/message-get?view=graph-rest-1.0&tabs=http
+        """
+        message = await self._make_request("GET", f"me/messages/{message_id}")
+        
+        # Automatically mark message as read if requested (default behavior)
+        if mark_as_read:
+            try:
+                await self.mark_message_as_read(message_id)
+            except Exception as e:
+                logger.warning(f"Failed to mark message {message_id} as read: {e}")
+                # Continue even if marking as read fails
+        
+        return message
+    
+    async def mark_message_as_read(self, message_id: str) -> dict:
+        """
+        Mark a message as read by updating the isRead property.
+        
+        Reference: https://learn.microsoft.com/en-us/graph/api/message-update?view=graph-rest-1.0&tabs=http
+        """
+        payload = {"isRead": True}
+        return await self._make_request("PATCH", f"me/messages/{message_id}", json=payload)
+    
+    async def mark_message_as_unread(self, message_id: str) -> dict:
+        """
+        Mark a message as unread by updating the isRead property.
+        
+        Reference: https://learn.microsoft.com/en-us/graph/api/message-update?view=graph-rest-1.0&tabs=http
+        """
+        payload = {"isRead": False}
+        return await self._make_request("PATCH", f"me/messages/{message_id}", json=payload)
     
     async def send_mail(
         self, to: str, subject: str, body: str, body_type: str = "HTML"
@@ -412,7 +446,7 @@ async def get_mail_message(
     """Get a specific mail message by ID. Automatically marks the message as read."""
     try:
         client = get_client()
-        message = await client.get_mail_message(message_id)
+        message = await client.get_mail_message(message_id, mark_as_read=True)
         return {"message": message}
     except Exception as e:
         error_message = f"Error getting mail message: {str(e)}"
@@ -574,6 +608,66 @@ async def move_mail_message(
         return {"success": True, "result": result}
     except Exception as e:
         error_message = f"Error moving mail message: {str(e)}"
+        logger.error(error_message)
+        if ctx:
+            await ctx.error(error_message)
+        raise
+
+
+@server.tool(
+    name="mark-mail-message-read",
+    description="Mark a mail message as read by its ID. Useful for explicitly marking messages as read without retrieving the full content.",
+    annotations=ToolAnnotations(
+        title="Mark message as read",
+        readOnlyHint=False,
+        destructiveHint=False,
+        openWorldHint=False,
+    ),
+)
+async def mark_mail_message_read(
+    message_id: Annotated[
+        str,
+        Field(description="Message ID to mark as read")
+    ],
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Mark a mail message as read."""
+    try:
+        client = get_client()
+        result = await client.mark_message_as_read(message_id)
+        return {"success": True, "message": "Message marked as read", "result": result}
+    except Exception as e:
+        error_message = f"Error marking message as read: {str(e)}"
+        logger.error(error_message)
+        if ctx:
+            await ctx.error(error_message)
+        raise
+
+
+@server.tool(
+    name="mark-mail-message-unread",
+    description="Mark a mail message as unread by its ID. Useful for flagging messages that need attention later.",
+    annotations=ToolAnnotations(
+        title="Mark message as unread",
+        readOnlyHint=False,
+        destructiveHint=False,
+        openWorldHint=False,
+    ),
+)
+async def mark_mail_message_unread(
+    message_id: Annotated[
+        str,
+        Field(description="Message ID to mark as unread")
+    ],
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Mark a mail message as unread."""
+    try:
+        client = get_client()
+        result = await client.mark_message_as_unread(message_id)
+        return {"success": True, "message": "Message marked as unread", "result": result}
+    except Exception as e:
+        error_message = f"Error marking message as unread: {str(e)}"
         logger.error(error_message)
         if ctx:
             await ctx.error(error_message)
