@@ -296,7 +296,7 @@ def get_client(user_identifier: Optional[str] = None) -> MS365EmailClient:
 
 @server.tool(
     name="list-mail-messages",
-    description="List mail messages from inbox or a specific folder. By default, only lists unread messages from the Inbox folder (not sent items or other folders) to minimize token usage. Returns a list of messages with their details including subject, sender, received date, and message ID.",
+    description="List mail messages from inbox or a specific folder. By default, only lists unread messages from the Inbox folder (not sent items or other folders) to minimize token usage. Returns a list of messages with their details including subject, sender, received date, and message ID. NOTE: This only returns previews - to actually read an email and mark it as read, you MUST use get-mail-message with the message ID.",
     annotations=ToolAnnotations(
         title="List mail messages",
         readOnlyHint=True,
@@ -358,7 +358,7 @@ async def list_mail_folders(
 
 @server.tool(
     name="list-mail-folder-messages",
-    description="List messages from a specific folder by folder ID. By default, only returns unread messages to minimize token usage. Returns messages with their details.",
+    description="List messages from a specific folder by folder ID. By default, only returns unread messages to minimize token usage. Returns messages with their details. NOTE: This only returns previews - to actually read an email and mark it as read, you MUST use get-mail-message with the message ID.",
     annotations=ToolAnnotations(
         title="List folder messages",
         readOnlyHint=True,
@@ -395,7 +395,7 @@ async def list_mail_folder_messages(
 
 @server.tool(
     name="get-mail-message",
-    description="Get a specific mail message by its ID. Returns full message details including body, attachments, and metadata.",
+    description="Get a specific mail message by its ID. REQUIRED to actually read an email - automatically marks the message as read after retrieval. Returns full message details including body, attachments, and metadata. Use this (not list-mail-messages) when you need to read, process, or act on an email.",
     annotations=ToolAnnotations(
         title="Get mail message",
         readOnlyHint=True,
@@ -405,11 +405,11 @@ async def list_mail_folder_messages(
 async def get_mail_message(
     message_id: Annotated[
         str,
-        Field(description="Message ID to retrieve")
+        Field(description="Message ID to retrieve. The message will be automatically marked as read. Use this to actually read an email, not just list-mail-messages.")
     ],
     ctx: Context = None,
 ) -> dict[str, Any]:
-    """Get a specific mail message by ID."""
+    """Get a specific mail message by ID. Automatically marks the message as read."""
     try:
         client = get_client()
         message = await client.get_mail_message(message_id)
