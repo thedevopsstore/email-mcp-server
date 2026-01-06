@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-MS365 Email MCP Server
+MS365 Email MCP Server (Token-Only Version)
 A Model Context Protocol server for Microsoft 365 Outlook email operations.
-Uses OAuth 2.0 Client Credentials Flow for authentication.
+Uses token-based authentication - agents must provide JWT tokens for Microsoft Graph API.
 Built with FastMCP for simplified server implementation.
 """
 import os
 import sys
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, Optional, Dict
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
-from msal import ConfidentialClientApplication
+from fastmcp.server.dependencies import get_http_headers
 import httpx
 from loguru import logger
 
@@ -25,8 +25,6 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8100"))
 STATELESS_HTTP = os.getenv("STATELESS_HTTP", "true").lower() == "true"
 
-# Transport configuration - hardcoded to streamable-http
-# Reference: https://github.com/awslabs/mcp/blob/main/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/core/common/config.py#L67
 TRANSPORT = "streamable-http"  # FastMCP expects 'streamable-http' for HTTP/SSE transport
 
 # Initialize FastMCP server
@@ -39,69 +37,79 @@ server = FastMCP(
 )
 
 
+def extract_request_auth_from_headers() -> tuple[Optional[str], Optional[str]]:
+    """
+    Extract request authentication context from HTTP headers:
+    - access_token from `Authorization: Bearer <token>`
+    - user_identifier from `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier`
+    
+    Uses FastMCP's built-in get_http_headers() which automatically handles
+    request context and works even when MCP session isn't fully established.
+    Never raises exceptions - returns empty dict if no request context.
+
+    Expected header:
+    - Authorization: Bearer <token>
+    - X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier: <UPN or Graph user id>
+    """
+    # FastMCP's get_http_headers() never raises exceptions
+    # Returns empty dict if no request context
+    headers = get_http_headers(include_all=True)
+
+    access_token: Optional[str] = None
+    auth = headers.get("authorization")
+    if auth and auth.lower().startswith("bearer "):
+        access_token = auth[7:].strip() or None
+
+    user_identifier: Optional[str] = None
+    user_header = "x-amzn-bedrock-agentcore-runtime-custom-ms365-useridentifier"
+    raw_user = headers.get(user_header)
+    if isinstance(raw_user, str) and raw_user.strip():
+        user_identifier = raw_user.strip()
+
+    return access_token, user_identifier
+
+
 class MS365EmailClient:
     """
-    Microsoft 365 Email API client using Client Credentials Flow.
+    Microsoft 365 Email API client using token-based authentication.
+    
+    Agents must provide a JWT token for Microsoft Graph API. The token is used
+    directly for API calls - no token exchange or refresh is performed.
     
     Reference: https://learn.microsoft.com/en-us/graph/auth-v2-service?tabs=http
     
-    For shared mailboxes or app-only authentication, use user_identifier
-    (UserPrincipalName or Graph ID) instead of /me/ endpoints.
+    For shared mailboxes, use user_identifier (UserPrincipalName or Graph ID)
+    instead of /me/ endpoints.
     """
     
-    def __init__(self, user_identifier: Optional[str] = None):
-        self.client_id = os.getenv("MS365_CLIENT_ID")
-        self.client_secret = os.getenv("MS365_CLIENT_SECRET")
-        self.tenant_id = os.getenv("MS365_TENANT_ID")
+    def __init__(
+        self, 
+        access_token: str,
+        user_identifier: Optional[str] = None,
+        cloud_type: Optional[str] = None
+    ):
+        if not access_token:
+            raise ValueError("access_token is required for token-based authentication")
+        
+        # Remove "Bearer " prefix if present
+        if access_token.startswith("Bearer "):
+            self.access_token = access_token[7:]
+        else:
+            self.access_token = access_token
+        
         # User identifier for shared mailboxes (UserPrincipalName or Graph ID)
         # If not provided, defaults to /me/ (requires delegated permissions)
         self.user_identifier = user_identifier or os.getenv("MS365_USER_IDENTIFIER")
         
         # Determine cloud type (commercial or gov)
-        cloud_type = os.getenv("MS365_CLOUD_TYPE", "commercial").lower()
-        if cloud_type in ["gov", "government", "usgov"]:
-            self.authority_base = "https://login.microsoftonline.us"
+        effective_cloud_type = (cloud_type or os.getenv("MS365_CLOUD_TYPE", "commercial")).lower()
+        
+        if effective_cloud_type in ["gov", "government", "usgov"]:
             self.graph_base = "https://graph.microsoft.us"
         else:
-            self.authority_base = "https://login.microsoftonline.com"
             self.graph_base = "https://graph.microsoft.com"
         
-        if not all([self.client_id, self.client_secret, self.tenant_id]):
-            raise ValueError(
-                "MS365_CLIENT_ID, MS365_CLIENT_SECRET, and MS365_TENANT_ID must be set"
-            )
-        
-        # Configure MSAL ConfidentialClientApplication for client credentials flow
-        # Reference: https://learn.microsoft.com/en-us/graph/auth-v2-service?tabs=http
-        self.authority = f"{self.authority_base}/{self.tenant_id}"
-        self.scope = [f"{self.graph_base}/.default"]
-        
-        self.app = ConfidentialClientApplication(
-            self.client_id,
-            authority=self.authority,
-            client_credential=self.client_secret
-        )
-    
-    def get_access_token(self) -> str:
-        """
-        Get access token using Client Credentials Flow.
-        
-        Reference: https://learn.microsoft.com/en-us/graph/auth-v2-service?tabs=http#step-3-request-an-access-token
-        """
-        # MSAL caches client credential tokens inside the application instance.
-        # Try silent acquisition first before requesting a new token.
-        result = self.app.acquire_token_silent(self.scope, account=None)
-
-        if not result:
-            result = self.app.acquire_token_for_client(scopes=self.scope)
-
-        if "access_token" in result:
-            logger.info("Access token acquired successfully (MSAL cache hit=%s)", bool(result.get("token_source") == "cache"))
-            return result["access_token"]
-        else:
-            error = result.get("error_description", result.get("error", "Unknown error"))
-            logger.error(f"Failed to acquire token: {error}")
-            raise Exception(f"Failed to acquire token: {error}")
+        logger.debug("Using token-based authentication mode")
     
     def _build_endpoint(self, endpoint: str) -> str:
         """
@@ -138,45 +146,31 @@ class MS365EmailClient:
 
         url = f"{self.graph_base}{endpoint}"
 
-        last_response: Optional[httpx.Response] = None
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
 
-        for attempt in range(2):
-            token = self.get_access_token()
+        async with httpx.AsyncClient() as client:
+            response = await client.request(method, url, headers=headers, **kwargs)
 
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
+        # If token is expired/invalid, log warning before raising
+        if response.status_code == 401:
+            logger.warning("Access token expired or invalid. Agent should refresh the token.")
+        
+        response.raise_for_status()
 
-            async with httpx.AsyncClient() as client:
-                response = await client.request(method, url, headers=headers, **kwargs)
-            last_response = response
+        # Some endpoints (like sendMail) return 202 Accepted with empty body
+        # Reference: https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0&tabs=http
+        if not return_json or response.status_code in (202, 204):
+            return {"status": response.status_code, "status_text": response.reason_phrase}
 
-            if response.status_code == 401 and attempt == 0:
-                logger.warning("Access token expired or invalid. Refreshing token and retrying once...")
-                if self.app.token_cache:
-                    self.app.token_cache.clear()
-                continue
+        # Try to parse JSON, but handle empty responses gracefully
+        text = response.text.strip()
+        if not text:
+            return {"status": response.status_code, "status_text": response.reason_phrase}
 
-            response.raise_for_status()
-
-            # Some endpoints (like sendMail) return 202 Accepted with empty body
-            # Reference: https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0&tabs=http
-            if not return_json or response.status_code in (202, 204):
-                return {"status": response.status_code, "status_text": response.reason_phrase}
-
-            # Try to parse JSON, but handle empty responses gracefully
-            text = response.text.strip()
-            if not text:
-                return {"status": response.status_code, "status_text": response.reason_phrase}
-
-            return response.json()
-
-        # If we exhausted retries, raise the last response error
-        if last_response is not None:
-            last_response.raise_for_status()
-
-        raise Exception("Request failed without a valid HTTP response")
+        return response.json()
     
     async def list_mail_messages(
         self, 
@@ -282,7 +276,13 @@ class MS365EmailClient:
         Reference: https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0&tabs=http
         
         Returns 202 Accepted with empty body - the message is queued for delivery.
+        
+        Args:
+            body_type: Must be "HTML" or "Text" (default: "HTML")
         """
+        if body_type not in ["HTML", "Text"]:
+            raise ValueError("body_type must be 'HTML' or 'Text'")
+        
         payload = {
             "message": {
                 "subject": subject,
@@ -307,7 +307,15 @@ class MS365EmailClient:
     async def create_draft_email(
         self, to: str, subject: str, body: str, body_type: str = "HTML"
     ) -> dict:
-        """Create a draft email."""
+        """
+        Create a draft email.
+        
+        Args:
+            body_type: Must be "HTML" or "Text" (default: "HTML")
+        """
+        if body_type not in ["HTML", "Text"]:
+            raise ValueError("body_type must be 'HTML' or 'Text'")
+        
         payload = {
             "subject": subject,
             "body": {
@@ -318,27 +326,57 @@ class MS365EmailClient:
         }
         endpoint = self._build_endpoint("me/messages")
         return await self._make_request("POST", endpoint, json=payload)
-    
-# Initialize client (lazy initialization)
-_ms365_client: Optional[MS365EmailClient] = None
 
-
-def get_client(user_identifier: Optional[str] = None) -> MS365EmailClient:
+def get_client(
+    access_token: Optional[str] = None,
+    user_identifier: Optional[str] = None,
+    cloud_type: Optional[str] = None
+) -> MS365EmailClient:
     """
     Get or create MS365 email client.
     
-    Args:
-        user_identifier: Optional UserPrincipalName or Graph ID for shared mailboxes.
-                        If not provided, uses MS365_USER_IDENTIFIER env var or /me/ endpoints.
-    """
-    global _ms365_client
-    # Use provided user_identifier or environment variable
-    effective_user_id = user_identifier or os.getenv("MS365_USER_IDENTIFIER")
+    Token-based authentication only - access_token is required.
     
-    # Create new client if user_identifier changed or client doesn't exist
-    if _ms365_client is None or _ms365_client.user_identifier != effective_user_id:
-        _ms365_client = MS365EmailClient(user_identifier=effective_user_id)
-    return _ms365_client
+    Priority:
+    1. Function parameters (access_token, user_identifier)
+    2. HTTP headers:
+       - Authorization header for access_token
+       - X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier for user_identifier
+    3. Environment variable (MS365_USER_IDENTIFIER) for user_identifier
+    
+    Args:
+        access_token: Optional JWT token for Microsoft Graph API (Bearer token, with or without "Bearer " prefix).
+                     If not provided, will attempt to extract from Authorization header.
+        user_identifier: Optional UserPrincipalName or Graph ID for shared mailboxes.
+                        If not provided, will attempt to extract from custom header or environment variable.
+        cloud_type: Optional cloud type: "commercial" or "gov"
+    """
+    # Read headers once (only if we need them)
+    hdr_token: Optional[str] = None
+    hdr_user: Optional[str] = None
+    if not access_token or not user_identifier:
+        hdr_token, hdr_user = extract_request_auth_from_headers()
+
+    # Priority: function parameter > headers
+    effective_token = access_token or hdr_token
+    if not effective_token:
+        raise ValueError(
+            "access_token is required. Provide it via tool parameter or "
+            "Authorization header (Bearer <token>)"
+        )
+    
+    # Determine effective user identifier
+    # Priority: function parameter > custom header > environment variable
+    effective_user_id = user_identifier or hdr_user or os.getenv("MS365_USER_IDENTIFIER")
+
+    # NOTE: We intentionally do not cache MS365EmailClient instances by token.
+    # Caching would keep bearer tokens in process memory indefinitely and provides
+    # little benefit (this client is lightweight and we create httpx clients per request).
+    return MS365EmailClient(
+        access_token=effective_token,
+        user_identifier=effective_user_id,
+        cloud_type=cloud_type,
+    )
 
 
 @server.tool(
@@ -351,6 +389,10 @@ def get_client(user_identifier: Optional[str] = None) -> MS365EmailClient:
     ),
 )
 async def list_mail_messages(
+    access_token: Annotated[
+        Optional[str],
+        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the Authorization header (Bearer <token>).")
+    ] = None,
     folder_id: Annotated[
         Optional[str],
         Field(description="Optional folder ID. If not provided, lists from Inbox folder.")
@@ -363,9 +405,16 @@ async def list_mail_messages(
         bool,
         Field(description="If True, only returns unread messages. Set to False to get all messages including read ones. (default: True)")
     ] = True,
+    user_identifier: Annotated[
+        Optional[str],
+        Field(description="Optional: UserPrincipalName or Graph ID for shared mailboxes.")
+    ] = None,
 ) -> dict[str, Any]:
     """List mail messages from inbox or a specific folder. Returns previews only - use get-mail-message for full body content."""
-    client = get_client()
+    client = get_client(
+        access_token=access_token,
+        user_identifier=user_identifier
+    )
     messages = await client.list_mail_messages(
         folder_id=folder_id, 
         top=top, 
@@ -383,9 +432,18 @@ async def list_mail_messages(
         openWorldHint=False,
     ),
 )
-async def list_mail_folders() -> dict[str, Any]:
+async def list_mail_folders(
+    access_token: Annotated[
+        Optional[str],
+        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the Authorization header (Bearer <token>).")
+    ] = None,
+    user_identifier: Annotated[
+        Optional[str],
+        Field(description="Optional: UserPrincipalName or Graph ID for shared mailboxes.")
+    ] = None,
+) -> dict[str, Any]:
     """List all mail folders."""
-    client = get_client()
+    client = get_client(access_token=access_token, user_identifier=user_identifier)
     folders = await client.list_mail_folders()
     return {"folders": folders, "count": len(folders)}
 
@@ -404,9 +462,17 @@ async def get_mail_message(
         str,
         Field(description="Message ID to retrieve. The message will be automatically marked as read.")
     ],
+    access_token: Annotated[
+        Optional[str],
+        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the Authorization header (Bearer <token>).")
+    ] = None,
+    user_identifier: Annotated[
+        Optional[str],
+        Field(description="Optional: UserPrincipalName or Graph ID for shared mailboxes.")
+    ] = None,
 ) -> dict[str, Any]:
     """Get a specific mail message by ID. Automatically marks the message as read."""
-    client = get_client()
+    client = get_client(access_token=access_token, user_identifier=user_identifier)
     message = await client.get_mail_message(message_id, mark_as_read=True)
     return {"message": message}
 
@@ -438,16 +504,17 @@ async def send_mail(
         str,
         Field(description="Body content type: 'HTML' or 'Text' (default: 'HTML')")
     ] = "HTML",
+    access_token: Annotated[
+        Optional[str],
+        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the Authorization header (Bearer <token>).")
+    ] = None,
     user_identifier: Annotated[
         Optional[str],
-        Field(description="Optional: UserPrincipalName or Graph ID for shared mailboxes. If not provided, uses MS365_USER_IDENTIFIER env var or /me/ endpoint.")
+        Field(description="Optional: UserPrincipalName or Graph ID for shared mailboxes.")
     ] = None,
 ) -> dict[str, Any]:
     """Send an email."""
-    if body_type not in ["HTML", "Text"]:
-        raise ValueError("body_type must be 'HTML' or 'Text'")
-    
-    client = get_client(user_identifier=user_identifier)
+    client = get_client(access_token=access_token, user_identifier=user_identifier)
     result = await client.send_mail(to, subject, body, body_type)
     return {"success": True, "result": result}
 
@@ -467,9 +534,17 @@ async def delete_mail_message(
         str,
         Field(description="Message ID to delete")
     ],
+    access_token: Annotated[
+        Optional[str],
+        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the Authorization header (Bearer <token>).")
+    ] = None,
+    user_identifier: Annotated[
+        Optional[str],
+        Field(description="Optional: UserPrincipalName or Graph ID for shared mailboxes.")
+    ] = None,
 ) -> dict[str, Any]:
     """Delete a mail message."""
-    client = get_client()
+    client = get_client(access_token=access_token, user_identifier=user_identifier)
     result = await client.delete_mail_message(message_id)
     return {"success": True, "message": "Message deleted successfully", "result": result}
 
@@ -501,33 +576,27 @@ async def create_draft_email(
         str,
         Field(description="Body content type: 'HTML' or 'Text' (default: 'HTML')")
     ] = "HTML",
+    access_token: Annotated[
+        Optional[str],
+        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the Authorization header (Bearer <token>).")
+    ] = None,
+    user_identifier: Annotated[
+        Optional[str],
+        Field(description="Optional: UserPrincipalName or Graph ID for shared mailboxes.")
+    ] = None,
 ) -> dict[str, Any]:
     """Create a draft email."""
-    if body_type not in ["HTML", "Text"]:
-        raise ValueError("body_type must be 'HTML' or 'Text'")
-    
-    client = get_client()
+    client = get_client(access_token=access_token, user_identifier=user_identifier)
     draft = await client.create_draft_email(to, subject, body, body_type)
     return {"success": True, "draft": draft}
 
 
 def main():
     """Main entry point for the MS365 Email MCP server."""
-    # Validate required environment variables
-    if not all([
-        os.getenv("MS365_CLIENT_ID"),
-        os.getenv("MS365_CLIENT_SECRET"),
-        os.getenv("MS365_TENANT_ID")
-    ]):
-        error_message = (
-            "MS365_CLIENT_ID, MS365_CLIENT_SECRET, and MS365_TENANT_ID must be set"
-        )
-        logger.error(error_message)
-        raise ValueError(error_message)
-    
-    logger.info(f"Starting MS365 Email MCP Server on {HOST}:{PORT}")
+    logger.info(f"Starting MS365 Email MCP Server (Token-Only) on {HOST}:{PORT}")
     logger.info(f"Transport: {TRANSPORT}")
     logger.info(f"Stateless HTTP: {STATELESS_HTTP}")
+    logger.info("Authentication: Token-based only (agents must provide access_token)")
     
     # Run the server with explicit transport
     # TRANSPORT: 'stdio' or 'streamable-http' (FastMCP accepts these values)
@@ -543,3 +612,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Server error: {e}", exc_info=True)
         sys.exit(1)
+
