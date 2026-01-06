@@ -8,7 +8,7 @@ Built with FastMCP for simplified server implementation.
 import os
 import sys
 from typing import Annotated, Any, Optional
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from msal import ConfidentialClientApplication
@@ -103,19 +103,11 @@ class MS365EmailClient:
             logger.error(f"Failed to acquire token: {error}")
             raise Exception(f"Failed to acquire token: {error}")
     
-    def _build_endpoint(self, endpoint: str) -> str:
-        """
-        Build endpoint with correct user prefix.
-        
-        Args:
-            endpoint: Endpoint starting with "me/" (e.g., "me/messages")
-        
-        Returns:
-            Endpoint with "me/" or "users/{id}/" prefix based on user_identifier
-        """
+    def _get_user_prefix(self) -> str:
+        """Get the user prefix for endpoints (/me/ or /users/{id}/)."""
         if self.user_identifier:
-            return endpoint.replace("me/", f"users/{self.user_identifier}/", 1)
-        return endpoint
+            return f"users/{self.user_identifier}"
+        return "me"
     
     async def _make_request(
         self, method: str, endpoint: str, return_json: bool = True, **kwargs
@@ -131,9 +123,14 @@ class MS365EmailClient:
             return_json: Whether to parse JSON response (default: True)
                         Set to False for endpoints that return empty body (e.g., sendMail returns 202)
         """
-        # Note: Endpoint should already be transformed by _build_endpoint() in calling methods
+        # Replace /me/ with user-specific endpoint if user_identifier is set
+        if self.user_identifier and endpoint.startswith("me/"):
+            endpoint = endpoint.replace("me/", f"users/{self.user_identifier}/", 1)
+        elif self.user_identifier and "/me/" in endpoint:
+            endpoint = endpoint.replace("/me/", f"/users/{self.user_identifier}/")
+
         # Ensure endpoint starts with /v1.0 or /beta
-        if not endpoint.startswith(("/v1.0", "/beta")):
+        if not endpoint.startswith("/v1.0") and not endpoint.startswith("/beta"):
             endpoint = f"/v1.0/{endpoint.lstrip('/')}"
 
         url = f"{self.graph_base}{endpoint}"
@@ -179,40 +176,25 @@ class MS365EmailClient:
         raise Exception("Request failed without a valid HTTP response")
     
     async def list_mail_messages(
-        self, 
-        folder_id: Optional[str] = None, 
-        top: int = 25, 
-        unread_only: bool = True
+        self, folder_id: Optional[str] = None, top: int = 25, unread_only: bool = True
     ) -> list:
         """
         List mail messages from inbox or a specific folder.
-        
-        Note: This endpoint only returns bodyPreview (first 255 characters) per Microsoft Graph API.
-        To get full email body content, use get_mail_message() with the message ID.
-        
-        Note: This endpoint does NOT support marking messages as read. To mark a message as read,
-        use get_mail_message() which automatically marks messages as read, or use mark_message_as_read().
         
         By default, only lists unread messages from the Inbox folder to avoid scanning
         all folders (inbox, sent items, deleted items, etc.) and minimize token usage.
         
         Reference: https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1.0&tabs=http
-        
-        Args:
-            folder_id: Optional folder ID. If not provided, defaults to Inbox.
-            top: Number of messages to retrieve (default: 25)
-            unread_only: If True, only returns unread messages (default: True)
         """
         # Default to Inbox folder to avoid scanning all folders
         # Use well-known folder name "Inbox" which is supported by Microsoft Graph
         if folder_id:
-            endpoint = self._build_endpoint(f"me/mailFolders/{folder_id}/messages")
+            endpoint = f"me/mailFolders/{folder_id}/messages"
         else:
-            endpoint = self._build_endpoint("me/mailFolders/Inbox/messages")
+            endpoint = "me/mailFolders/Inbox/messages"
         
         # Use $select to reduce response size and improve performance
-        # Note: List messages endpoint only returns bodyPreview, not full body
-        # To get full body, use get_mail_message() with the message ID
+        # Only fetch essential properties to minimize token usage
         params = {
             "$top": top,
             "$orderby": "receivedDateTime desc",
@@ -224,32 +206,34 @@ class MS365EmailClient:
             params["$filter"] = "isRead eq false"
         
         result = await self._make_request("GET", endpoint, params=params)
-        messages = result.get("value", [])
-        
-        return messages
+        return result.get("value", [])
     
     async def list_mail_folders(self) -> list:
         """List all mail folders."""
-        endpoint = self._build_endpoint("me/mailFolders")
-        result = await self._make_request("GET", endpoint)
+        result = await self._make_request("GET", "me/mailFolders")
         return result.get("value", [])
+    
+    async def list_mail_folder_messages(self, folder_id: str, top: int = 25, unread_only: bool = True) -> list:
+        """List messages from a specific folder. By default, only returns unread messages."""
+        return await self.list_mail_messages(folder_id=folder_id, top=top, unread_only=unread_only)
     
     async def get_mail_message(self, message_id: str, mark_as_read: bool = True) -> dict:
         """
         Get a specific mail message by ID.
         
-        Args:
-            message_id: Message ID to retrieve
-            mark_as_read: If True, automatically marks the message as read (default: True)
+        By default, marks the message as read after retrieving it.
         
         Reference: https://learn.microsoft.com/en-us/graph/api/message-get?view=graph-rest-1.0&tabs=http
         """
-        endpoint = self._build_endpoint(f"me/messages/{message_id}")
-        message = await self._make_request("GET", endpoint)
+        message = await self._make_request("GET", f"me/messages/{message_id}")
         
-        # Automatically mark message as read when retrieved
+        # Automatically mark message as read if requested (default behavior)
         if mark_as_read:
-            await self.mark_message_as_read(message_id)
+            try:
+                await self.mark_message_as_read(message_id)
+            except Exception as e:
+                logger.warning(f"Failed to mark message {message_id} as read: {e}")
+                # Continue even if marking as read fails
         
         return message
     
@@ -260,8 +244,7 @@ class MS365EmailClient:
         Reference: https://learn.microsoft.com/en-us/graph/api/message-update?view=graph-rest-1.0&tabs=http
         """
         payload = {"isRead": True}
-        endpoint = self._build_endpoint(f"me/messages/{message_id}")
-        return await self._make_request("PATCH", endpoint, json=payload)
+        return await self._make_request("PATCH", f"me/messages/{message_id}", json=payload)
     
     async def mark_message_as_unread(self, message_id: str) -> dict:
         """
@@ -270,8 +253,7 @@ class MS365EmailClient:
         Reference: https://learn.microsoft.com/en-us/graph/api/message-update?view=graph-rest-1.0&tabs=http
         """
         payload = {"isRead": False}
-        endpoint = self._build_endpoint(f"me/messages/{message_id}")
-        return await self._make_request("PATCH", endpoint, json=payload)
+        return await self._make_request("PATCH", f"me/messages/{message_id}", json=payload)
     
     async def send_mail(
         self, to: str, subject: str, body: str, body_type: str = "HTML"
@@ -295,14 +277,12 @@ class MS365EmailClient:
             "saveToSentItems": "true"
         }
         # sendMail returns 202 Accepted with no response body
-        endpoint = self._build_endpoint("me/sendMail")
-        return await self._make_request("POST", endpoint, return_json=False, json=payload)
+        return await self._make_request("POST", "me/sendMail", return_json=False, json=payload)
     
     async def delete_mail_message(self, message_id: str) -> dict:
         """Delete a mail message. Returns 204 No Content with empty body."""
         # DELETE returns 204 No Content with no response body
-        endpoint = self._build_endpoint(f"me/messages/{message_id}")
-        return await self._make_request("DELETE", endpoint, return_json=False)
+        return await self._make_request("DELETE", f"me/messages/{message_id}", return_json=False)
     
     async def create_draft_email(
         self, to: str, subject: str, body: str, body_type: str = "HTML"
@@ -316,9 +296,16 @@ class MS365EmailClient:
             },
             "toRecipients": [{"emailAddress": {"address": to}}]
         }
-        endpoint = self._build_endpoint("me/messages")
-        return await self._make_request("POST", endpoint, json=payload)
+        return await self._make_request("POST", "me/messages", json=payload)
     
+    async def move_mail_message(self, message_id: str, destination_id: str) -> dict:
+        """Move a mail message to another folder."""
+        payload = {"destinationId": destination_id}
+        return await self._make_request(
+            "POST", f"me/messages/{message_id}/move", json=payload
+        )
+
+
 # Initialize client (lazy initialization)
 _ms365_client: Optional[MS365EmailClient] = None
 
@@ -343,7 +330,7 @@ def get_client(user_identifier: Optional[str] = None) -> MS365EmailClient:
 
 @server.tool(
     name="list-mail-messages",
-    description="Lists email PREVIEWS only (bodyPreview field, ~255 chars). ⚠️ WARNING: This does NOT return full email content. Use get-mail-message with the message ID to read full content. ⚠️ NOTE: This endpoint cannot mark messages as read. Use get-mail-message to read full content and automatically mark as read. By default, returns unread messages from the Inbox.",
+    description="List mail messages from inbox or a specific folder. By default, only lists unread messages from the Inbox folder (not sent items or other folders) to minimize token usage. Returns a list of messages with their details including subject, sender, received date, and message ID. NOTE: This only returns previews - to actually read an email and mark it as read, you MUST use get-mail-message with the message ID.",
     annotations=ToolAnnotations(
         title="List mail messages",
         readOnlyHint=True,
@@ -353,7 +340,7 @@ def get_client(user_identifier: Optional[str] = None) -> MS365EmailClient:
 async def list_mail_messages(
     folder_id: Annotated[
         Optional[str],
-        Field(description="Optional folder ID. If not provided, lists from Inbox folder.")
+        Field(description="Optional folder ID or well-known folder name (e.g., 'Inbox', 'SentItems', 'Drafts'). If not provided, defaults to Inbox folder only.")
     ] = None,
     top: Annotated[
         int,
@@ -361,17 +348,21 @@ async def list_mail_messages(
     ] = 25,
     unread_only: Annotated[
         bool,
-        Field(description="If True, only returns unread messages. Set to False to get all messages including read ones. (default: True)")
+        Field(description="If true, only return unread messages. If false, return all messages (read and unread). Default: true.")
     ] = True,
+    ctx: Context = None,
 ) -> dict[str, Any]:
-    """List mail messages from inbox or a specific folder. Returns previews only - use get-mail-message for full body content."""
-    client = get_client()
-    messages = await client.list_mail_messages(
-        folder_id=folder_id, 
-        top=top, 
-        unread_only=unread_only
-    )
-    return {"messages": messages, "count": len(messages)}
+    """List mail messages from inbox or a specific folder. Defaults to unread messages from Inbox only to avoid scanning all folders."""
+    try:
+        client = get_client()
+        messages = await client.list_mail_messages(folder_id=folder_id, top=top, unread_only=unread_only)
+        return {"messages": messages, "count": len(messages)}
+    except Exception as e:
+        error_message = f"Error listing mail messages: {str(e)}"
+        logger.error(error_message)
+        if ctx:
+            await ctx.error(error_message)
+        raise
 
 
 @server.tool(
@@ -383,16 +374,62 @@ async def list_mail_messages(
         openWorldHint=False,
     ),
 )
-async def list_mail_folders() -> dict[str, Any]:
+async def list_mail_folders(
+    ctx: Context = None,
+) -> dict[str, Any]:
     """List all mail folders."""
-    client = get_client()
-    folders = await client.list_mail_folders()
-    return {"folders": folders, "count": len(folders)}
+    try:
+        client = get_client()
+        folders = await client.list_mail_folders()
+        return {"folders": folders, "count": len(folders)}
+    except Exception as e:
+        error_message = f"Error listing mail folders: {str(e)}"
+        logger.error(error_message)
+        if ctx:
+            await ctx.error(error_message)
+        raise
+
+
+@server.tool(
+    name="list-mail-folder-messages",
+    description="List messages from a specific folder by folder ID. By default, only returns unread messages to minimize token usage. Returns messages with their details. NOTE: This only returns previews - to actually read an email and mark it as read, you MUST use get-mail-message with the message ID.",
+    annotations=ToolAnnotations(
+        title="List folder messages",
+        readOnlyHint=True,
+        openWorldHint=False,
+    ),
+)
+async def list_mail_folder_messages(
+    folder_id: Annotated[
+        str,
+        Field(description="Folder ID to list messages from")
+    ],
+    top: Annotated[
+        int,
+        Field(description="Number of messages to retrieve (default: 25)", ge=1, le=100)
+    ] = 25,
+    unread_only: Annotated[
+        bool,
+        Field(description="If true, only return unread messages. If false, return all messages (read and unread). Default: true.")
+    ] = True,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """List messages from a specific folder. By default, only returns unread messages."""
+    try:
+        client = get_client()
+        messages = await client.list_mail_folder_messages(folder_id=folder_id, top=top, unread_only=unread_only)
+        return {"messages": messages, "count": len(messages)}
+    except Exception as e:
+        error_message = f"Error listing folder messages: {str(e)}"
+        logger.error(error_message)
+        if ctx:
+            await ctx.error(error_message)
+        raise
 
 
 @server.tool(
     name="get-mail-message",
-    description="⚠️ REQUIRED for reading full email content. Use this after list-mail-messages to get complete email body. Automatically marks message as read.",
+    description="Get a specific mail message by its ID. REQUIRED to actually read an email - automatically marks the message as read after retrieval. Returns full message details including body, attachments, and metadata. Use this (not list-mail-messages) when you need to read, process, or act on an email.",
     annotations=ToolAnnotations(
         title="Get mail message",
         readOnlyHint=True,
@@ -402,13 +439,21 @@ async def list_mail_folders() -> dict[str, Any]:
 async def get_mail_message(
     message_id: Annotated[
         str,
-        Field(description="Message ID to retrieve. The message will be automatically marked as read.")
+        Field(description="Message ID to retrieve. The message will be automatically marked as read. Use this to actually read an email, not just list-mail-messages.")
     ],
+    ctx: Context = None,
 ) -> dict[str, Any]:
     """Get a specific mail message by ID. Automatically marks the message as read."""
-    client = get_client()
-    message = await client.get_mail_message(message_id, mark_as_read=True)
-    return {"message": message}
+    try:
+        client = get_client()
+        message = await client.get_mail_message(message_id, mark_as_read=True)
+        return {"message": message}
+    except Exception as e:
+        error_message = f"Error getting mail message: {str(e)}"
+        logger.error(error_message)
+        if ctx:
+            await ctx.error(error_message)
+        raise
 
 
 @server.tool(
@@ -442,14 +487,22 @@ async def send_mail(
         Optional[str],
         Field(description="Optional: UserPrincipalName or Graph ID for shared mailboxes. If not provided, uses MS365_USER_IDENTIFIER env var or /me/ endpoint.")
     ] = None,
+    ctx: Context = None,
 ) -> dict[str, Any]:
     """Send an email."""
-    if body_type not in ["HTML", "Text"]:
-        raise ValueError("body_type must be 'HTML' or 'Text'")
-    
-    client = get_client(user_identifier=user_identifier)
-    result = await client.send_mail(to, subject, body, body_type)
-    return {"success": True, "result": result}
+    try:
+        if body_type not in ["HTML", "Text"]:
+            raise ValueError("body_type must be 'HTML' or 'Text'")
+        
+        client = get_client(user_identifier=user_identifier)
+        result = await client.send_mail(to, subject, body, body_type)
+        return {"success": True, "result": result}
+    except Exception as e:
+        error_message = f"Error sending mail: {str(e)}"
+        logger.error(error_message)
+        if ctx:
+            await ctx.error(error_message)
+        raise
 
 
 @server.tool(
@@ -467,11 +520,19 @@ async def delete_mail_message(
         str,
         Field(description="Message ID to delete")
     ],
+    ctx: Context = None,
 ) -> dict[str, Any]:
     """Delete a mail message."""
-    client = get_client()
-    result = await client.delete_mail_message(message_id)
-    return {"success": True, "message": "Message deleted successfully", "result": result}
+    try:
+        client = get_client()
+        result = await client.delete_mail_message(message_id)
+        return {"success": True, "message": "Message deleted successfully", "result": result}
+    except Exception as e:
+        error_message = f"Error deleting mail message: {str(e)}"
+        logger.error(error_message)
+        if ctx:
+            await ctx.error(error_message)
+        raise
 
 
 @server.tool(
@@ -501,14 +562,116 @@ async def create_draft_email(
         str,
         Field(description="Body content type: 'HTML' or 'Text' (default: 'HTML')")
     ] = "HTML",
+    ctx: Context = None,
 ) -> dict[str, Any]:
     """Create a draft email."""
-    if body_type not in ["HTML", "Text"]:
-        raise ValueError("body_type must be 'HTML' or 'Text'")
-    
-    client = get_client()
-    draft = await client.create_draft_email(to, subject, body, body_type)
-    return {"success": True, "draft": draft}
+    try:
+        if body_type not in ["HTML", "Text"]:
+            raise ValueError("body_type must be 'HTML' or 'Text'")
+        
+        client = get_client()
+        draft = await client.create_draft_email(to, subject, body, body_type)
+        return {"success": True, "draft": draft}
+    except Exception as e:
+        error_message = f"Error creating draft email: {str(e)}"
+        logger.error(error_message)
+        if ctx:
+            await ctx.error(error_message)
+        raise
+
+
+@server.tool(
+    name="move-mail-message",
+    description="Move a mail message to another folder by specifying the message ID and destination folder ID.",
+    annotations=ToolAnnotations(
+        title="Move mail message",
+        readOnlyHint=False,
+        destructiveHint=False,
+        openWorldHint=False,
+    ),
+)
+async def move_mail_message(
+    message_id: Annotated[
+        str,
+        Field(description="Message ID to move")
+    ],
+    destination_id: Annotated[
+        str,
+        Field(description="Destination folder ID")
+    ],
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Move a mail message to another folder."""
+    try:
+        client = get_client()
+        result = await client.move_mail_message(message_id, destination_id)
+        return {"success": True, "result": result}
+    except Exception as e:
+        error_message = f"Error moving mail message: {str(e)}"
+        logger.error(error_message)
+        if ctx:
+            await ctx.error(error_message)
+        raise
+
+
+@server.tool(
+    name="mark-mail-message-read",
+    description="Mark a mail message as read by its ID. Useful for explicitly marking messages as read without retrieving the full content.",
+    annotations=ToolAnnotations(
+        title="Mark message as read",
+        readOnlyHint=False,
+        destructiveHint=False,
+        openWorldHint=False,
+    ),
+)
+async def mark_mail_message_read(
+    message_id: Annotated[
+        str,
+        Field(description="Message ID to mark as read")
+    ],
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Mark a mail message as read."""
+    try:
+        client = get_client()
+        result = await client.mark_message_as_read(message_id)
+        return {"success": True, "message": "Message marked as read", "result": result}
+    except Exception as e:
+        error_message = f"Error marking message as read: {str(e)}"
+        logger.error(error_message)
+        if ctx:
+            await ctx.error(error_message)
+        raise
+
+
+@server.tool(
+    name="mark-mail-message-unread",
+    description="Mark a mail message as unread by its ID. Useful for flagging messages that need attention later.",
+    annotations=ToolAnnotations(
+        title="Mark message as unread",
+        readOnlyHint=False,
+        destructiveHint=False,
+        openWorldHint=False,
+    ),
+)
+async def mark_mail_message_unread(
+    message_id: Annotated[
+        str,
+        Field(description="Message ID to mark as unread")
+    ],
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Mark a mail message as unread."""
+    try:
+        client = get_client()
+        result = await client.mark_message_as_unread(message_id)
+        return {"success": True, "message": "Message marked as unread", "result": result}
+    except Exception as e:
+        error_message = f"Error marking message as unread: {str(e)}"
+        logger.error(error_message)
+        if ctx:
+            await ctx.error(error_message)
+        raise
 
 
 def main():
