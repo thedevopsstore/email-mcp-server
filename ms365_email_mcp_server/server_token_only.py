@@ -40,7 +40,7 @@ server = FastMCP(
 def extract_request_auth_from_headers() -> tuple[Optional[str], Optional[str]]:
     """
     Extract request authentication context from HTTP headers:
-    - access_token from `Authorization: Bearer <token>`
+    - access_token from `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization: Bearer <token>`
     - user_identifier from `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier`
     
     Uses FastMCP's built-in get_http_headers() which automatically handles
@@ -48,7 +48,7 @@ def extract_request_auth_from_headers() -> tuple[Optional[str], Optional[str]]:
     Never raises exceptions - returns empty dict if no request context.
 
     Expected header:
-    - Authorization: Bearer <token>
+    - X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization: Bearer <token>
     - X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier: <UPN or Graph user id>
     """
     # FastMCP's get_http_headers() never raises exceptions
@@ -56,9 +56,15 @@ def extract_request_auth_from_headers() -> tuple[Optional[str], Optional[str]]:
     headers = get_http_headers(include_all=True)
 
     access_token: Optional[str] = None
-    auth = headers.get("authorization")
-    if auth and auth.lower().startswith("bearer "):
-        access_token = auth[7:].strip() or None
+    auth_header = "x-amzn-bedrock-agentcore-runtime-custom-ms365-authorization"
+    auth = headers.get(auth_header)
+    if isinstance(auth, str) and auth.strip():
+        auth = auth.strip()
+        # Accept either "Bearer <token>" or raw token
+        if auth.lower().startswith("bearer "):
+            access_token = auth[7:].strip() or None
+        else:
+            access_token = auth or None
 
     user_identifier: Optional[str] = None
     user_header = "x-amzn-bedrock-agentcore-runtime-custom-ms365-useridentifier"
@@ -340,13 +346,13 @@ def get_client(
     Priority:
     1. Function parameters (access_token, user_identifier)
     2. HTTP headers:
-       - Authorization header for access_token
+       - X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization header for access_token
        - X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier for user_identifier
     3. Environment variable (MS365_USER_IDENTIFIER) for user_identifier
     
     Args:
         access_token: Optional JWT token for Microsoft Graph API (Bearer token, with or without "Bearer " prefix).
-                     If not provided, will attempt to extract from Authorization header.
+                     If not provided, will attempt to extract from X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization header.
         user_identifier: Optional UserPrincipalName or Graph ID for shared mailboxes.
                         If not provided, will attempt to extract from custom header or environment variable.
         cloud_type: Optional cloud type: "commercial" or "gov"
@@ -362,7 +368,7 @@ def get_client(
     if not effective_token:
         raise ValueError(
             "access_token is required. Provide it via tool parameter or "
-            "Authorization header (Bearer <token>)"
+            "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization header (Bearer <token>)"
         )
     
     # Determine effective user identifier
@@ -391,7 +397,7 @@ def get_client(
 async def list_mail_messages(
     access_token: Annotated[
         Optional[str],
-        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the Authorization header (Bearer <token>).")
+        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization header (Bearer <token>).")
     ] = None,
     folder_id: Annotated[
         Optional[str],
@@ -435,7 +441,7 @@ async def list_mail_messages(
 async def list_mail_folders(
     access_token: Annotated[
         Optional[str],
-        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the Authorization header (Bearer <token>).")
+        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization header (Bearer <token>).")
     ] = None,
     user_identifier: Annotated[
         Optional[str],
@@ -464,7 +470,7 @@ async def get_mail_message(
     ],
     access_token: Annotated[
         Optional[str],
-        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the Authorization header (Bearer <token>).")
+        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization header (Bearer <token>).")
     ] = None,
     user_identifier: Annotated[
         Optional[str],
@@ -506,7 +512,7 @@ async def send_mail(
     ] = "HTML",
     access_token: Annotated[
         Optional[str],
-        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the Authorization header (Bearer <token>).")
+        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization header (Bearer <token>).")
     ] = None,
     user_identifier: Annotated[
         Optional[str],
@@ -536,7 +542,7 @@ async def delete_mail_message(
     ],
     access_token: Annotated[
         Optional[str],
-        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the Authorization header (Bearer <token>).")
+        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization header (Bearer <token>).")
     ] = None,
     user_identifier: Annotated[
         Optional[str],
@@ -578,7 +584,7 @@ async def create_draft_email(
     ] = "HTML",
     access_token: Annotated[
         Optional[str],
-        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the Authorization header (Bearer <token>).")
+        Field(description="Optional: JWT token for Microsoft Graph API (Bearer token). If not provided, will be extracted from the X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization header (Bearer <token>).")
     ] = None,
     user_identifier: Annotated[
         Optional[str],

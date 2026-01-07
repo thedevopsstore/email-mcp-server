@@ -36,13 +36,17 @@ This document explains how to configure the MS365 Email MCP Server to support mu
                     └─────────────────────────┘
 ```
 
-## Solution: Pass Microsoft Graph Token via `Authorization` (Pass-Through)
+## Solution: Pass Microsoft Graph Token via AgentCore Custom Header (Pass-Through)
 
-AgentCore Runtime can be configured to pass through the standard `Authorization` header to your MCP server. Each agent obtains its own Microsoft Graph API token and passes it in `Authorization: Bearer <token>`. This is more secure than passing client secrets.
+AgentCore Runtime can be configured to pass through an AgentCore custom header to your MCP server. Each agent obtains its own Microsoft Graph API token and passes it in:
+
+- `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization: Bearer <token>`
+
+This avoids using the inbound `Authorization` header for Graph tokens and works well when inbound authentication is IAM-based.
 
 ### Step 1: Configure AgentCore Runtime Header Allowlist
 
-When creating or updating your AgentCore Runtime, configure it to allow the `Authorization` header (and any custom headers you need, like a shared-mailbox `user_identifier`):
+When creating or updating your AgentCore Runtime, configure it to allow the custom headers you need (Graph token + shared-mailbox `user_identifier`):
 
 ```bash
 aws bedrock-agentcore-control create-agent-runtime \
@@ -50,29 +54,23 @@ aws bedrock-agentcore-control create-agent-runtime \
   --agent-runtime-artifact containerConfiguration={containerUri=your-ecr-uri} \
   --request-header-configuration '{
     "requestHeaderAllowlist": [
-      "Authorization",
+      "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization",
       "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier"
     ]
-  }' \
-  --inbound-authorization-configuration '{
-    "customJwtAuthorizerConfiguration": {
-      "discoveryUrl": "https://login.microsoftonline.com/{tenant_id}/.well-known/openid-configuration",
-      "allowedClients": [
-        "agent-1-client-id",
-        "agent-2-client-id",
-        "agent-3-client-id"
-      ]
-    }
   }'
 ```
 
 **Important**: Custom headers must start with `X-Amzn-Bedrock-AgentCore-Runtime-Custom-`
 
+### Inbound Authentication Note
+
+If you are using **IAM-based access** to AgentCore Runtime (recommended for your scenario), you do **not** configure a JWT authorizer. Each agent/service calls the runtime using AWS credentials (SigV4).
+
 ### Step 2: Agents Obtain and Pass Token
 
 Each agent:
 1. Uses its own `client_id` and `client_secret` to get a JWT token for Microsoft Graph API
-2. Passes that token in the standard `Authorization` header
+2. Passes that token in the `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization` header
 
 **Helper function to get Microsoft Graph API token:**
 
@@ -126,9 +124,6 @@ def get_graph_api_token(
 # In your Strands agent code
 import requests
 
-# Step 1: Get JWT token for AgentCore Runtime authentication
-runtime_jwt = get_runtime_jwt_token()  # Your agent's JWT for AgentCore Runtime
-
 # Step 2: Get Microsoft Graph API token using agent's credentials
 graph_token = get_graph_api_token(
     client_id=os.getenv("AGENT_CLIENT_ID"),
@@ -140,8 +135,9 @@ graph_token = get_graph_api_token(
 response = requests.post(
     f"https://bedrock-agentcore.{region}.amazonaws.com/runtimes/{runtime_arn}/invocations",
     headers={
-        "Authorization": f"Bearer {runtime_jwt}",  # For AgentCore Runtime
-        "Authorization": f"Bearer {graph_token}",  # For Graph API (passed through)
+        # Inbound auth to AgentCore Runtime is IAM (SigV4) in this model.
+        # Use AWS SDK / SigV4-capable HTTP client in production.
+        "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization": f"Bearer {graph_token}",
         "Content-Type": "application/json"
     },
     json={

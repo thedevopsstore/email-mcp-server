@@ -1,6 +1,6 @@
 # AWS AgentCore Runtime Deployment Guide
 
-This guide walks through deploying the MS365 Email MCP Server as an AWS AgentCore Runtime using **S3-based code upload** with **OAuth 2.0 JWT authentication** for the US Government cloud endpoint.
+This guide walks through deploying the MS365 Email MCP Server as an AWS AgentCore Runtime using **S3-based code upload** with **IAM (SigV4) inbound authentication**, while passing the **Microsoft Graph access token** via AgentCore Runtime custom headers.
 
 ---
 
@@ -14,10 +14,9 @@ This guide walks through deploying the MS365 Email MCP Server as an AWS AgentCor
 4. [Step 1: Prepare Your MCP Server Package](#step-1-prepare-your-mcp-server-package)
 5. [Step 2: Upload to S3](#step-2-upload-to-s3)
 6. [Step 3: Create IAM Roles](#step-3-create-iam-roles)
-7. [Step 4: Configure OAuth 2.0 JWT Authorizer](#step-4-configure-oauth-20-jwt-authorizer)
-8. [Step 5: Create AgentCore Runtime](#step-5-create-agentcore-runtime)
-9. [Step 6: Configure Request Header Allowlist](#step-6-configure-request-header-allowlist)
-10. [Step 7: Test Your Deployment](#step-7-test-your-deployment)
+7. [Step 4: Configure Request Header Allowlist](#step-4-configure-request-header-allowlist)
+8. [Step 5: Create AgentCore Runtime (IAM Auth)](#step-5-create-agentcore-runtime-iam-auth)
+9. [Step 6: Test Your Deployment](#step-6-test-your-deployment)
 11. [Troubleshooting](#troubleshooting)
 
 ---
@@ -43,36 +42,49 @@ Choose one of the following deployment approaches based on your preferences:
 
 The **AgentCore Starter Toolkit** provides an interactive CLI that guides you through the deployment process with prompts for all required configuration. This is the easiest way to get started.
 
+**⚠️ Important Note:** The AgentCore CLI commands and structure are evolving. The commands shown below are examples based on typical CLI patterns. **Always verify the actual commands** by running `agentcore --help` after installation, and refer to the [official documentation](https://aws.github.io/bedrock-agentcore-starter-toolkit/) for the most current commands.
+
 #### A.1 Install the AgentCore CLI
 
 ```bash
 pip install bedrock-agentcore-starter-toolkit
+
+# Verify installation and see available commands
+agentcore --help
 ```
 
 **Note:** The AgentCore CLI typically uses **Amazon ECR** for containerized deployments. If you specifically need S3-based deployment, use **Option B** below.
 
-#### A.2 Initialize Your Project
+#### A.2 Create Configuration File
 
-Navigate to your project directory and initialize the AgentCore configuration:
+Navigate to your project directory and create an `agentcore.yaml` configuration file manually, or use the CLI's interactive configuration:
 
 ```bash
 cd /path/to/email-mcp-server
 
-# Initialize with your entry point file
-agentcore init --entry-point ms365_email_mcp_server/server_token_only.py --protocol MCP
+# Option 1: Create agentcore.yaml manually (see A.4 for template)
+# Option 2: Use CLI configure command (if available)
+agentcore configure
 ```
 
-This creates an `agentcore.yaml` configuration file in your project.
+**Note:** The exact CLI commands may vary. Check available commands with:
+```bash
+agentcore --help
+# or
+pip show bedrock-agentcore-starter-toolkit
+```
 
-#### A.3 Configure Interactively
+#### A.3 Configure Interactively (if supported)
 
-Run the interactive configuration wizard:
+If the CLI supports interactive configuration, run:
 
 ```bash
 agentcore configure
 ```
 
-The CLI will prompt you for:
+**Note:** If `agentcore configure` is not available, create the `agentcore.yaml` file manually (see A.4 below).
+
+If the interactive wizard is available, it will prompt you for:
 
 1. **Runtime Name**: 
    ```
@@ -86,29 +98,22 @@ The CLI will prompt you for:
    - Press `Enter` to have the CLI create the role automatically, or
    - Provide your existing role ARN
 
-3. **OAuth 2.0 Configuration**:
-   ```
-   Enable OAuth 2.0 JWT authentication? (yes/no) [yes]: yes
-   
-   Enter discovery URL: https://login.microsoftonline.us/<YOUR_TENANT_ID>/v2.0/.well-known/openid-configuration
-   
-   Enter allowed audiences (comma-separated): api://<YOUR_CLIENT_ID>,<YOUR_CLIENT_ID>
-   
-   Enter allowed client IDs (comma-separated): <CLIENT_ID_1>,<CLIENT_ID_2>
-   
-   Enter allowed scopes (comma-separated): Mail.Read,Mail.ReadWrite,Mail.Send
-   ```
+3. **Inbound Authentication (IAM)**:
+   - No OAuth/JWT authorizer is configured in this model.
+   - Calls to the runtime are authorized using AWS IAM (SigV4).
 
 4. **Environment Variables**:
    ```
    Enter environment variables (key=value, comma-separated):
-   MS365_CLOUD_TYPE=gov,LOG_LEVEL=INFO,HOST=0.0.0.0,PORT=8100,STATELESS_HTTP=true
+   MS365_CLOUD_TYPE=gov,LOG_LEVEL=INFO,HOST=0.0.0.0,PORT=8000,STATELESS_HTTP=true
    ```
+   
+   **Important:** AgentCore Runtime requires MCP servers to listen on **port 8000** internally. The external port is managed by AgentCore Runtime itself.
 
 5. **Request Header Allowlist**:
    ```
    Enter request headers to allowlist (comma-separated):
-   Authorization,X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier
+   X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization,X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier
    ```
 
 6. **Cloud Configuration** (if prompted):
@@ -116,15 +121,17 @@ The CLI will prompt you for:
    Select cloud type [commercial/gov]: gov
    ```
 
-#### A.4 Review Configuration
+#### A.4 Create/Review Configuration File
 
-The CLI creates an `agentcore.yaml` file. Review it:
+Create or review the `agentcore.yaml` configuration file:
+
+If the CLI created the file automatically, review it:
 
 ```bash
 cat agentcore.yaml
 ```
 
-You should see something like:
+**Or create it manually** with the following template:
 
 ```yaml
 runtime:
@@ -132,31 +139,19 @@ runtime:
   protocol: MCP
   entryPoint: ms365_email_mcp_server/server_token_only.py
   runtime: python3.11
-  
-authorizer:
-  type: JWT_BEARER_TOKEN
-  discoveryUrl: https://login.microsoftonline.us/<TENANT_ID>/v2.0/.well-known/openid-configuration
-  allowedAudiences:
-    - api://<CLIENT_ID>
-    - <CLIENT_ID>
-  allowedClients:
-    - <CLIENT_ID_1>
-    - <CLIENT_ID_2>
-  allowedScopes:
-    - Mail.Read
-    - Mail.ReadWrite
-    - Mail.Send
+
+# Inbound auth is IAM (SigV4) in this model (no JWT authorizer configured)
 
 requestHeaders:
   allowlist:
-    - Authorization
+    - X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization
     - X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier
 
 environment:
   MS365_CLOUD_TYPE: gov
   LOG_LEVEL: INFO
   HOST: 0.0.0.0
-  PORT: "8100"
+  PORT: "8000"  # Required: AgentCore Runtime expects port 8000
   STATELESS_HTTP: "true"
 ```
 
@@ -227,32 +222,89 @@ This approach gives you full control over the deployment process and uses **S3 f
 
 ---
 
+## Port Configuration for AgentCore Runtime
+
+### ⚠️ Important: Port Requirements
+
+When deploying to **AgentCore Runtime**, your MCP server **must** be configured as follows:
+
+| Setting | Value | Reason |
+|---------|-------|--------|
+| **Host** | `0.0.0.0` | Required - server must listen on all interfaces |
+| **Port** | `8000` | **Required** - AgentCore Runtime expects MCP servers on port 8000 |
+| **External Port** | Managed by AgentCore | Clients connect to the runtime endpoint, not the container port |
+
+### How Ports Work in AgentCore Runtime
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Client/Agent                         │
+│  Connects to: https://runtime.bedrock-agentcore...     │
+│  (AgentCore-managed endpoint, NOT port 8000 directly)  │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│            AgentCore Runtime Load Balancer              │
+│  Routes to container's /mcp endpoint on port 8000      │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│         MCP Server Container (Your Code)                │
+│  Must listen on: 0.0.0.0:8000                          │
+│  FastMCP handles /mcp endpoint automatically           │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Key Points:**
+- **Internal Port**: Your MCP server **must** listen on port `8000` inside the container
+- **External Port**: AgentCore Runtime manages the external endpoint; clients never connect directly to port 8000
+- **Port Mapping**: There's no port mapping like Docker (`-p 8000:8000`) - AgentCore handles routing automatically
+- **Local Development**: For local testing (not AgentCore), you can use any port (e.g., 8100)
+
+### Setting the Port for AgentCore
+
+Set the port via environment variable in your runtime configuration:
+
+```bash
+# In agentcore.yaml or runtime config
+environment:
+  PORT: "8000"  # Required for AgentCore Runtime
+  HOST: "0.0.0.0"  # Required for AgentCore Runtime
+```
+
+---
+
 ## Architecture Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         Agent/Client                            │
-│  (Strands Agent, MCP Client with JWT token from Entra ID)      │
+│  (Strands Agent, MCP Client with AWS creds + Graph token)      │
+│  Connects to: https://runtime.bedrock-agentcore...             │
 └────────────────────────┬────────────────────────────────────────┘
-                         │ Authorization: Bearer <jwt_token>
+                         │ X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization: Bearer <graph_token>
                          │ X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│              AWS AgentCore Runtime (JWT Authorizer)             │
-│  - Validates JWT against login.microsoftonline.us (GCC)        │
-│  - Passes Authorization header through to MCP server            │
-│  - Passes custom headers (user_identifier)                      │
+│              AWS AgentCore Runtime (IAM SigV4)                  │
+│  - Authorizes inbound via IAM                                  │
+│  - Routes to container on port 8000 (/mcp endpoint)            │
+│  - Passes allowlisted custom headers to MCP server             │
 └────────────────────────┬────────────────────────────────────────┘
-                         │ Authorization: Bearer <jwt_token>
+                         │ Internal: 0.0.0.0:8000/mcp
+                         │ X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization: Bearer <graph_token>
                          │ X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │           MS365 Email MCP Server (server_token_only.py)         │
-│  - Extracts token from Authorization header                     │
+│  - Listens on 0.0.0.0:8000 (required)                          │
+│  - Extracts token from X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization header
 │  - Extracts user_identifier from custom header                  │
 │  - Uses token directly for Microsoft Graph API calls            │
 └────────────────────────┬────────────────────────────────────────┘
-                         │ Authorization: Bearer <jwt_token>
+                         │ Authorization: Bearer <graph_token>
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │              Microsoft Graph API (graph.microsoft.us)           │
@@ -261,9 +313,8 @@ This approach gives you full control over the deployment process and uses **S3 f
 ```
 
 **Key Points:**
-- The same JWT token is used for **both** AgentCore authentication **and** Graph API access
-- AgentCore validates the JWT against Microsoft Entra ID (GCC endpoint)
-- The token is passed through to the MCP server via the `Authorization` header
+- Inbound access to AgentCore Runtime uses **IAM (SigV4)** (no OAuth/JWT authorizer in this model)
+- The Microsoft Graph token is passed through to the MCP server via `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization`
 - No client secrets are passed in headers (security best practice)
 
 ---
@@ -404,72 +455,22 @@ echo "Execution Role ARN: ${EXECUTION_ROLE_ARN}"
 
 ---
 
-## Step 4: Configure OAuth 2.0 JWT Authorizer
+## Step 4: Configure Request Header Allowlist
 
-### 4.1 Set Microsoft Entra ID Variables
+The `requestHeaderAllowlist` is **critical** for the token-only Graph flow. It tells AgentCore Runtime which HTTP headers to pass through to your MCP server.
 
-```bash
-# For US Government Cloud (GCC)
-export TENANT_ID="your-tenant-id"
-export CLIENT_ID="your-client-id"  # Your agent's client ID
-export DISCOVERY_URL="https://login.microsoftonline.us/${TENANT_ID}/v2.0/.well-known/openid-configuration"
+Allowlist these headers:
 
-# For Commercial Cloud (use this instead if not using GCC)
-# export DISCOVERY_URL="https://login.microsoftonline.com/${TENANT_ID}/v2.0/.well-known/openid-configuration"
-```
+- `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization` (Graph access token)
+- `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier` (shared mailbox selector, optional)
 
-**Important:** The discovery URL for US Government cloud uses `login.microsoftonline.us` as documented in [Microsoft's GCC documentation](https://learn.microsoft.com/en-us/azure/active-directory/develop/authentication-national-cloud).
-
-### 4.2 Create JWT Authorizer Configuration
-
-Create a file `jwt-authorizer-config.json`:
-
-```json
-{
-  "type": "JWT_BEARER_TOKEN",
-  "jwtBearerTokenAuthorizerConfig": {
-    "discoveryUrl": "https://login.microsoftonline.us/<TENANT_ID>/v2.0/.well-known/openid-configuration",
-    "allowedAudiences": [
-      "api://<CLIENT_ID>",
-      "<CLIENT_ID>"
-    ],
-    "allowedClients": [
-      "<CLIENT_ID_1>",
-      "<CLIENT_ID_2>"
-    ],
-    "allowedScopes": [
-      "Mail.Read",
-      "Mail.ReadWrite",
-      "Mail.Send"
-    ],
-    "customClaims": {
-      "upn": "upn",
-      "oid": "oid"
-    }
-  }
-}
-```
-
-**Replace placeholders:**
-- `<TENANT_ID>`: Your Azure AD tenant ID
-- `<CLIENT_ID>`: Your primary client ID (used in audience validation)
-- `<CLIENT_ID_1>`, `<CLIENT_ID_2>`: Client IDs of all agents that will consume this MCP server
-
-**Configuration Details:**
-
-| Field | Description |
-|-------|-------------|
-| `discoveryUrl` | OpenID Connect discovery endpoint for JWT validation. Use `login.microsoftonline.us` for GCC, `login.microsoftonline.com` for commercial. |
-| `allowedAudiences` | List of valid `aud` claims in the JWT. Typically `api://{clientId}` or the client ID itself. |
-| `allowedClients` | List of client IDs (`azp` or `appid` claims) allowed to access this runtime. Add all agent client IDs here. |
-| `allowedScopes` | Required OAuth scopes in the JWT token. Match these to your Microsoft Graph API permissions. |
-| `customClaims` | Map JWT claims to custom attributes (optional). Useful for extracting user principal name or object ID. |
-
-**Reference:** [AWS AgentCore JWT Authorizer Documentation](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_AuthorizerConfiguration.html)
+Reference: [RequestHeaderConfiguration API Documentation](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_RequestHeaderConfiguration.html)
 
 ---
 
-## Step 5: Create AgentCore Runtime
+## Step 5: Create AgentCore Runtime (IAM Auth)
+
+Inbound authentication is IAM (SigV4) in this model—no JWT authorizer configuration is required.
 
 ### 5.1 Create Runtime Configuration
 
@@ -478,7 +479,7 @@ Create a file `agentcore-runtime-config.json`:
 ```json
 {
   "name": "ms365-email-mcp-runtime",
-  "description": "MS365 Email MCP Server with OAuth 2.0 JWT authentication for US Government Cloud",
+  "description": "MS365 Email MCP Server (IAM inbound auth) with Graph token passed via AgentCore custom header",
   "runtimeType": "MCP",
   "runtimeConfig": {
     "mcpRuntimeConfig": {
@@ -492,7 +493,7 @@ Create a file `agentcore-runtime-config.json`:
           "MS365_CLOUD_TYPE": "gov",
           "LOG_LEVEL": "INFO",
           "HOST": "0.0.0.0",
-          "PORT": "8100",
+          "PORT": "8000",
           "STATELESS_HTTP": "true"
         },
         "timeout": 300,
@@ -501,33 +502,14 @@ Create a file `agentcore-runtime-config.json`:
       "transportConfig": {
         "type": "HTTP",
         "httpConfig": {
-          "port": 8100
+          "port": 8000
         }
       }
     }
   },
-  "authorizerConfiguration": {
-    "type": "JWT_BEARER_TOKEN",
-    "jwtBearerTokenAuthorizerConfig": {
-      "discoveryUrl": "https://login.microsoftonline.us/<TENANT_ID>/v2.0/.well-known/openid-configuration",
-      "allowedAudiences": [
-        "api://<CLIENT_ID>",
-        "<CLIENT_ID>"
-      ],
-      "allowedClients": [
-        "<CLIENT_ID_1>",
-        "<CLIENT_ID_2>"
-      ],
-      "allowedScopes": [
-        "Mail.Read",
-        "Mail.ReadWrite",
-        "Mail.Send"
-      ]
-    }
-  },
   "requestHeaderConfiguration": {
     "requestHeaderAllowlist": [
-      "Authorization",
+      "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization",
       "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier"
     ]
   },
@@ -537,9 +519,6 @@ Create a file `agentcore-runtime-config.json`:
 
 **Replace placeholders:**
 - `s3Uri`: Your S3 URI from Step 2.3
-- `<TENANT_ID>`: Your Azure AD tenant ID
-- `<CLIENT_ID>`: Your primary client ID
-- `<CLIENT_ID_1>`, `<CLIENT_ID_2>`: Client IDs of agents
 - `executionRoleArn`: Your execution role ARN from Step 3.3
 
 **Key Configuration Sections:**
@@ -560,7 +539,7 @@ Create a file `agentcore-runtime-config.json`:
   "MS365_CLOUD_TYPE": "gov",  // "gov" for GCC, "commercial" for standard
   "LOG_LEVEL": "INFO",
   "HOST": "0.0.0.0",
-  "PORT": "8100",
+  "PORT": "8000",
   "STATELESS_HTTP": "true"
 }
 ```
@@ -568,13 +547,13 @@ Create a file `agentcore-runtime-config.json`:
 #### Request Header Allowlist (Critical!)
 ```json
 "requestHeaderAllowlist": [
-  "Authorization",
+  "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization",
   "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier"
 ]
 ```
 
 **Why this matters:**
-- `Authorization`: Passes the JWT token through to the MCP server for Graph API calls
+- `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization`: Passes the Microsoft Graph access token through to the MCP server for Graph API calls
 - `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier`: Passes the user identifier for shared mailbox access
 
 **Reference:** [RequestHeaderConfiguration API Documentation](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_RequestHeaderConfiguration.html)
@@ -600,7 +579,7 @@ echo "Runtime ARN: ${RUNTIME_ARN}"
 
 ---
 
-## Step 6: Configure Request Header Allowlist
+## Appendix: Header Allowlist Deep Dive
 
 The `requestHeaderAllowlist` is **critical** for the token-only authentication flow. It tells AgentCore Runtime which HTTP headers to pass through to your MCP server.
 
@@ -608,21 +587,21 @@ The `requestHeaderAllowlist` is **critical** for the token-only authentication f
 
 ```
 Agent Request Headers:
-├── Authorization: Bearer <jwt_token>
+├── X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization: Bearer <graph_token>
 ├── X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier: user@domain.com
 └── Other headers...
 
-                    ↓ (AgentCore validates JWT)
+                    ↓ (AgentCore authorizes inbound via IAM; passes allowlisted headers)
 
 AgentCore passes through (based on allowlist):
-├── Authorization: Bearer <jwt_token>  ✅ (in allowlist)
+├── X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization: Bearer <graph_token>  ✅ (in allowlist)
 ├── X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier: user@domain.com  ✅ (in allowlist)
 └── Other headers... ❌ (not in allowlist, dropped)
 
                     ↓
 
 MCP Server receives:
-├── Authorization: Bearer <jwt_token>
+├── X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization: Bearer <graph_token>
 └── X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier: user@domain.com
 ```
 
@@ -633,7 +612,7 @@ The configuration from Step 5.1 includes:
 ```json
 "requestHeaderConfiguration": {
   "requestHeaderAllowlist": [
-    "Authorization",
+    "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization",
     "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier"
   ]
 }
@@ -643,7 +622,7 @@ The configuration from Step 5.1 includes:
 
 | Header | Purpose | Required |
 |--------|---------|----------|
-| `Authorization` | Contains `Bearer <jwt_token>` for Microsoft Graph API access | ✅ Yes |
+| `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization` | Contains `Bearer <graph_token>` for Microsoft Graph API access | ✅ Yes |
 | `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier` | UserPrincipalName or Graph ID for shared mailbox access | Optional |
 
 ### 6.3 Update Existing Runtime (if needed)
@@ -664,7 +643,7 @@ aws bedrock-agentcore update-runtime \
 
 ---
 
-## Step 7: Test Your Deployment
+## Step 6: Test Your Deployment
 
 ### 7.1 Obtain a JWT Token
 
@@ -677,12 +656,12 @@ az login --use-device-code --cloud AzureUSGovernment  # For GCC
 az login --use-device-code  # For commercial
 
 # Get token for Microsoft Graph
-export JWT_TOKEN=$(az account get-access-token \
+export GRAPH_TOKEN=$(az account get-access-token \
   --resource https://graph.microsoft.us \
   --query accessToken \
   --output tsv)
 
-echo "JWT Token (first 50 chars): ${JWT_TOKEN:0:50}..."
+echo "Graph token (first 50 chars): ${GRAPH_TOKEN:0:50}..."
 ```
 
 **For production agents**, use MSAL Python or JavaScript:
@@ -697,7 +676,7 @@ app = ConfidentialClientApplication(
 )
 
 result = app.acquire_token_for_client(scopes=["https://graph.microsoft.us/.default"])
-jwt_token = result["access_token"]
+graph_token = result["access_token"]
 ```
 
 ### 7.2 Test MCP Server Directly
@@ -710,18 +689,20 @@ export RUNTIME_ENDPOINT=$(aws bedrock-agentcore get-runtime \
   --output text \
   --region ${AWS_REGION})
 
-# Test list-mail-messages tool
-curl -X POST "${RUNTIME_ENDPOINT}/invoke" \
-  -H "Authorization: Bearer ${JWT_TOKEN}" \
-  -H "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier: user@domain.com" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tool": "list-mail-messages",
-    "parameters": {
-      "top": 10,
-      "unread_only": true
-    }
-  }'
+# Inbound auth is IAM (SigV4), so you must use an AWS SDK or a SigV4-capable HTTP client.
+# The important part is the headers you pass through to the MCP server:
+#
+# - X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization: Bearer <graph_token>
+# - X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier: <optional>
+#
+# Example payload:
+# {
+#   "tool": "list-mail-messages",
+#   "parameters": {
+#     "top": 10,
+#     "unread_only": true
+#   }
+# }
 ```
 
 ### 7.3 Expected Response
@@ -759,7 +740,7 @@ mcp_tool = MCPTool(
     name="ms365-email",
     runtime_arn=RUNTIME_ARN,
     headers={
-        "Authorization": f"Bearer {jwt_token}",
+        "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization": f"Bearer {graph_token}",
         "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier": "user@domain.com"
     }
 )
@@ -780,56 +761,57 @@ print(response)
 
 ## Troubleshooting
 
-### Issue: "Unauthorized" or 401 Error
+### Issue: "AccessDenied" / 403 from AgentCore Runtime
 
 **Possible Causes:**
-1. JWT token is expired or invalid
-2. JWT `aud` claim doesn't match `allowedAudiences`
-3. JWT `azp` or `appid` claim not in `allowedClients`
-4. JWT scopes don't match `allowedScopes`
+1. Caller doesn't have AWS credentials (or is using the wrong profile/role)
+2. IAM policy doesn't allow invoking the runtime
+
+**Solution:**
+- Verify the AWS identity you are using (role/user/profile)
+- Update IAM policy to allow invoking the AgentCore runtime
+
+### Issue: "access_token is required" (from MCP server)
+
+**Possible Causes:**
+1. `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization` header not allowlisted
+2. Caller didn't send the header
 
 **Solution:**
 ```bash
-# Decode your JWT token to inspect claims
-echo ${JWT_TOKEN} | cut -d'.' -f2 | base64 -d | jq .
-
-# Verify:
-# - "aud" matches one of your allowedAudiences
-# - "azp" or "appid" matches one of your allowedClients
-# - "scp" or "roles" contains required scopes
-```
-
-### Issue: "Authorization header not found"
-
-**Possible Causes:**
-1. `Authorization` not in `requestHeaderAllowlist`
-2. Agent not sending `Authorization` header
-
-**Solution:**
-```bash
-# Update runtime to include Authorization in allowlist
+# Update runtime to include the custom header(s) in the allowlist
 aws bedrock-agentcore update-runtime \
   --runtime-arn ${RUNTIME_ARN} \
   --request-header-configuration '{
-    "requestHeaderAllowlist": ["Authorization"]
+    "requestHeaderAllowlist": [
+      "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization",
+      "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier"
+    ]
   }' \
   --region ${AWS_REGION}
 ```
 
-### Issue: "Invalid discovery URL"
+### Issue: "Graph API returns 401"
 
 **Possible Causes:**
-1. Wrong cloud endpoint (commercial vs government)
-2. Tenant ID is incorrect
+1. Graph token expired/invalid
+2. Token minted for the wrong Graph cloud (`graph.microsoft.com` vs `graph.microsoft.us`)
+3. Missing Graph permissions (`Mail.Read`, `Mail.Send`, etc.)
 
 **Solution:**
-```bash
-# Test discovery URL manually
-curl https://login.microsoftonline.us/${TENANT_ID}/v2.0/.well-known/openid-configuration
+- Re-mint the Graph token from the correct authority and resource
+- Ensure correct scopes/permissions are granted and consented
 
-# Should return JSON with "issuer", "jwks_uri", etc.
-# If 404, verify tenant ID and cloud type
-```
+### Issue: "Token acquisition fails" (Graph token)
+
+**Possible Causes:**
+1. Wrong authority for your cloud (commercial vs gov)
+2. Wrong Graph resource (`graph.microsoft.com` vs `graph.microsoft.us`)
+3. Missing admin consent / permissions for Graph
+
+**Solution:**
+- For US Gov cloud, use authority base `https://login.microsoftonline.us` (and Graph resource `https://graph.microsoft.us`)
+- Re-check the app registration permissions and admin consent
 
 ### Issue: "S3 access denied"
 
@@ -873,14 +855,14 @@ unzip -l ms365-email-mcp-server.zip | grep server_token_only
 ### Issue: "Graph API returns 401"
 
 **Possible Causes:**
-1. JWT token doesn't have Graph API permissions
+1. Graph token doesn't have Graph API permissions
 2. Token is for wrong cloud (commercial vs government)
 3. Token audience is wrong
 
 **Solution:**
 ```bash
 # Verify token audience and resource
-echo ${JWT_TOKEN} | cut -d'.' -f2 | base64 -d | jq .aud
+echo ${GRAPH_TOKEN} | cut -d'.' -f2 | base64 -d | jq .aud
 
 # For GCC, should be: "https://graph.microsoft.us"
 # For commercial, should be: "https://graph.microsoft.com"
@@ -890,6 +872,54 @@ az account get-access-token \
   --resource https://graph.microsoft.us \
   --query accessToken \
   --output tsv
+```
+
+### Issue: "Connection refused" or "Cannot connect to MCP server"
+
+**Possible Causes:**
+1. Wrong port configured (not 8000)
+2. Server not listening on 0.0.0.0
+3. Container not starting properly
+
+**Solution:**
+```bash
+# Verify runtime environment variables include PORT=8000
+aws bedrock-agentcore get-runtime \
+  --runtime-arn ${RUNTIME_ARN} \
+  --query 'runtime.runtimeConfig.mcpRuntimeConfig.serverConfig.environmentVariables' \
+  --region ${AWS_REGION}
+
+# Should show:
+# {
+#   "PORT": "8000",
+#   "HOST": "0.0.0.0",
+#   ...
+# }
+
+# Check runtime logs for port binding errors
+agentcore logs --runtime-name ms365-email-mcp-runtime
+
+# Look for messages like:
+# "Listening on 0.0.0.0:8000"
+# NOT "Listening on 0.0.0.0:8100" or "127.0.0.1:8000"
+```
+
+### Issue: "Port already in use" or "Address already in use"
+
+**Possible Causes:**
+1. Multiple instances trying to bind to port 8000
+2. Port conflict in container
+
+**Solution:**
+```bash
+# This shouldn't happen in AgentCore Runtime (each container is isolated)
+# If you see this locally, ensure you're using the correct port:
+
+# For local development (NOT AgentCore):
+PORT=8100 python -m ms365_email_mcp_server.server_token_only
+
+# For AgentCore Runtime:
+PORT=8000  # Must be 8000
 ```
 
 ### Issue: "agentcore: command not found"
@@ -933,17 +963,19 @@ aws iam attach-role-policy \
 ### Issue: "agentcore.yaml not found"
 
 **Possible Causes:**
-1. `agentcore configure` not run
+1. Configuration file not created
 2. In wrong directory
+3. CLI doesn't auto-create the file
 
 **Solution:**
 ```bash
-# Initialize configuration first
-agentcore init --entry-point ms365_email_mcp_server/server_token_only.py --protocol MCP
-
-# Or navigate to project root
+# Option 1: Create agentcore.yaml manually (see template in A.4)
+# Option 2: Navigate to project root and use CLI (if available)
 cd /path/to/email-mcp-server
-agentcore configure
+agentcore configure  # If this command exists
+
+# Option 3: Check what commands are available
+agentcore --help
 ```
 
 ### Issue: "Configuration validation failed"
@@ -951,7 +983,7 @@ agentcore configure
 **Possible Causes:**
 1. Invalid YAML syntax
 2. Missing required fields
-3. Invalid OAuth discovery URL
+3. Missing/invalid required fields
 
 **Solution:**
 ```bash
@@ -961,48 +993,62 @@ agentcore validate
 # Check YAML syntax
 yamllint agentcore.yaml  # if installed
 
-# Test discovery URL manually
-curl https://login.microsoftonline.us/<TENANT_ID>/v2.0/.well-known/openid-configuration
+# If you are not using an OAuth/JWT authorizer for inbound auth (IAM model), there is no discovery URL to validate.
 ```
 
 ---
 
 ## Quick Reference: AgentCore CLI Commands
 
+**Note:** The exact CLI commands may vary. Always verify with `agentcore --help` after installation.
+
 ```bash
 # Install
 pip install bedrock-agentcore-starter-toolkit
 
-# Initialize project
-agentcore init --entry-point <entry_point> --protocol MCP
+# Check available commands
+agentcore --help
 
-# Interactive configuration
-agentcore configure
+# Common commands (verify these exist in your version):
+# - agentcore configure (if available)
+# - agentcore create-runtime (or similar)
+# - agentcore deploy (or agentcore launch)
+# - agentcore list-runtimes (or agentcore list)
+# - agentcore describe-runtime
+# - agentcore update-runtime
+# - agentcore delete-runtime
 
-# Deploy
-agentcore launch
-
-# List runtimes
-agentcore list
-
-# Describe runtime
-agentcore describe --runtime-name <name>
-
-# Update runtime
-agentcore update
-
-# Delete runtime
-agentcore delete --runtime-name <name>
-
-# View logs
+# View logs (if available)
 agentcore logs --runtime-name <name>
 
-# Validate configuration
+# Validate configuration (if available)
 agentcore validate
+```
 
-# Help
-agentcore --help
-agentcore <command> --help
+**Important:** The AgentCore CLI commands are evolving. For the most up-to-date commands, refer to:
+- [AgentCore Starter Toolkit Documentation](https://aws.github.io/bedrock-agentcore-starter-toolkit/)
+- [AWS AgentCore Developer Guide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/)
+
+---
+
+## Updating Your Deployment
+
+After your initial deployment, see **[UPDATING_DEPLOYMENT.md](./UPDATING_DEPLOYMENT.md)** for detailed instructions on:
+- Deploying new code versions
+- Updating configuration (environment variables, headers, OAuth)
+- Version management and rollback procedures
+- Best practices for updates
+
+**Quick Update Commands:**
+
+```bash
+# Using AgentCore CLI
+agentcore update
+
+# Using AWS CLI (S3-based)
+aws bedrock-agentcore update-runtime \
+  --runtime-arn ${RUNTIME_ARN} \
+  --cli-input-json file://update-config.json
 ```
 
 ---
@@ -1011,8 +1057,8 @@ agentcore <command> --help
 
 ### AWS AgentCore Documentation
 - [AWS AgentCore Runtime API Reference](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/Welcome.html)
-- [AWS AgentCore JWT Authorizer Configuration](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_AuthorizerConfiguration.html)
 - [AWS Request Header Configuration](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_RequestHeaderConfiguration.html)
+- [AgentCore Runtime Versioning](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agent-runtime-versioning.html)
 - [AgentCore Starter Toolkit Documentation](https://aws.github.io/bedrock-agentcore-starter-toolkit/)
 - [AgentCore CLI Quickstart Guide](https://aws.github.io/bedrock-agentcore-starter-toolkit/user-guide/runtime/quickstart.html)
 - [AgentCore CLI GitHub Repository](https://github.com/aws/bedrock-agentcore-starter-toolkit)
@@ -1030,11 +1076,19 @@ agentcore <command> --help
 You've successfully deployed the MS365 Email MCP Server as an AWS AgentCore Runtime with:
 
 ✅ **S3-based code deployment** (no ECR required)  
-✅ **OAuth 2.0 JWT authentication** using Microsoft Entra ID  
+✅ **IAM (SigV4) inbound authentication** to AgentCore Runtime  
 ✅ **US Government Cloud support** (`login.microsoftonline.us`, `graph.microsoft.us`)  
-✅ **Authorization header pass-through** for Graph API access  
+✅ **Custom header pass-through** for Graph API access (`X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization`)  
 ✅ **Custom header support** for shared mailbox access  
-✅ **Multi-agent support** via `allowedClients` configuration  
+✅ **Multi-agent support** via IAM policies + per-agent Graph tokens
+✅ **Correct port configuration**: Server listening on `0.0.0.0:8000` (required by AgentCore Runtime)
 
-Your agents can now securely access Microsoft 365 email operations using their own JWT tokens, with no client secrets passed in headers.
+### Key Port Configuration Notes:
+
+- **Internal Port**: Your MCP server **must** listen on port `8000` inside the container
+- **Host**: Server **must** bind to `0.0.0.0` (not `127.0.0.1` or `localhost`)
+- **External Port**: AgentCore Runtime manages the external endpoint automatically
+- **No Port Mapping Needed**: AgentCore routes requests to your container's port 8000 internally
+
+Your agents can now securely access Microsoft 365 email operations using their own JWT tokens, with no client secrets passed in headers. Agents connect to the AgentCore Runtime endpoint (not directly to port 8000), and the runtime routes requests to your MCP server.
 

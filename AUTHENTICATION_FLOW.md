@@ -2,7 +2,7 @@
 
 This document explains the dual authentication layers when hosting an MCP server on AWS AgentCore Runtime:
 
-1. **Inbound Authentication**: How clients authenticate to the MCP server (OAuth 2.0)
+1. **Inbound Authentication**: How clients authenticate to AgentCore Runtime (**IAM SigV4**, by default)
 2. **Outbound Authentication**: How the MCP server authenticates to third-party providers (Microsoft Graph API, etc.)
 
 ---
@@ -11,18 +11,17 @@ This document explains the dual authentication layers when hosting an MCP server
 
 ```
 ┌─────────────┐
-│   Client    │ (Agent or User)
-│  (OAuth 2.0 │
-│   JWT Token)│
+│   Client    │ (Agent or Service)
+│ (AWS creds) │
 └──────┬──────┘
        │ 1. Inbound Auth
-       │    (OAuth 2.0 JWT)
+       │    (IAM SigV4)
        ▼
 ┌─────────────────────────────────────┐
 │   AWS AgentCore Runtime              │
-│   - Validates JWT token              │
+│   - Authorizes via IAM (SigV4)       │
 │   - Routes to MCP server             │
-│   - Provides Workload Access Token   │
+│   - Passes allowlisted headers       │
 └──────┬──────────────────────────────┘
        │
        │ 2. MCP Server receives request
@@ -43,46 +42,27 @@ This document explains the dual authentication layers when hosting an MCP server
 
 ---
 
-## Layer 1: Inbound Authentication (Client → MCP Server)
+## Layer 1: Inbound Authentication (Client → AgentCore Runtime)
 
 ### How It Works
 
-When a client (agent or user) wants to access your MCP server hosted on AgentCore Runtime:
+When a client (agent/service) wants to access your MCP server hosted on AgentCore Runtime:
 
-1. **Client obtains OAuth 2.0 JWT token** from an identity provider (e.g., AWS Cognito, Auth0, Microsoft Entra ID)
-2. **Client sends request** to AgentCore Runtime with JWT token in `Authorization: Bearer <token>` header
-3. **AgentCore Runtime validates the JWT token** using the configured authorizer:
-   - Validates token signature
-   - Checks `iss` (issuer) matches discovery URL
-   - Verifies `aud` (audience) is in allowed audiences
-   - Validates `client_id` is in allowed clients
-   - Checks `scope` matches allowed scopes
-   - Verifies token expiration
-4. **AgentCore Runtime routes request** to your MCP server at `0.0.0.0:8000/mcp`
-5. **AgentCore Runtime provides Workload Access Token** in the `WorkloadAccessToken` header for your MCP server to use
+1. **Client signs the request with AWS SigV4** (using AWS credentials / IAM role)
+2. **AgentCore Runtime authorizes the request using IAM policy**
+3. **AgentCore Runtime routes request** to your MCP server at `0.0.0.0:8000/mcp`
 
 ### Configuration
 
-When creating your AgentCore Runtime, configure the inbound authorizer:
+Inbound authentication uses **IAM by default**. Ensure:
 
-```bash
-aws bedrock-agentcore-control create-agent-runtime \
-  --agent-runtime-name ms365-email-mcp-server \
-  --inbound-authorization-configuration '{
-    "customJwtAuthorizerConfiguration": {
-      "discoveryUrl": "https://login.microsoftonline.com/{tenant_id}/.well-known/openid-configuration",
-      "allowedClients": ["client-id-1", "client-id-2"],
-      "allowedAudiences": ["api://your-api"],
-      "allowedScopes": ["read:emails", "send:emails"]
-    }
-  }'
-```
+- Your caller has AWS credentials (role/user)
+- IAM policy allows invoking the AgentCore runtime
 
 **Key Points:**
-- AgentCore Runtime handles all JWT validation
-- Your MCP server doesn't need to validate inbound tokens
-- Multiple clients can authenticate (multi-agent support)
-- OAuth 2.0 compliant (supports standard JWT tokens)
+- AgentCore Runtime handles IAM authorization
+- Your MCP server doesn't need to validate inbound identity tokens
+- Multiple clients can authenticate via IAM (multi-agent support)
 
 ---
 
@@ -156,10 +136,10 @@ This is where your MCP server authenticates to Microsoft Graph API (or other thi
 This is what your current `server_token_only.py` implementation does:
 
 1. **Agents obtain Microsoft Graph tokens themselves** (using their own Azure AD app registrations)
-2. **Agents pass the Graph token via the standard `Authorization` header** (passed through to the runtime):
+2. **Agents pass the Graph token via an AgentCore Runtime custom header** (passed through to the runtime):
    ```python
    headers = {
-       "Authorization": f"Bearer {graph_token}"
+       "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization": f"Bearer {graph_token}"
    }
    ```
 
@@ -167,8 +147,9 @@ This is what your current `server_token_only.py` implementation does:
    ```python
    def extract_token_from_headers() -> Optional[str]:
        headers = get_http_headers(include_all=True)
-       auth = headers.get("authorization", "")
-       return auth[7:] if auth.lower().startswith("bearer ") else None
+       raw = headers.get("x-amzn-bedrock-agentcore-runtime-custom-ms365-authorization", "")
+       raw = raw.strip() if isinstance(raw, str) else ""
+       return raw[7:].strip() if raw.lower().startswith("bearer ") else (raw or None)
    ```
 
 4. **MCP server uses token directly** for Microsoft Graph API calls (no token exchange)
@@ -203,8 +184,8 @@ This is what your current `server_token_only.py` implementation does:
 
 Your `server_token_only.py` uses **Approach 2 (Token Pass-Through)**:
 
-1. **Inbound**: AgentCore Runtime validates JWT tokens from agents
-2. **Outbound**: MCP server extracts Microsoft Graph tokens from custom headers and uses them directly
+1. **Inbound**: AgentCore Runtime authorizes requests via IAM (SigV4)
+2. **Outbound**: MCP server extracts Microsoft Graph tokens from `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization` and uses them directly
 
 **Flow:**
 ```

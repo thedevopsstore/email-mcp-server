@@ -2,9 +2,9 @@
 
 This document explains the **token-only** implementation in `ms365_email_mcp_server/server_token_only.py`.
 
-In this model, the **agent obtains a Microsoft Graph access token** (for example using MSAL) and passes it to the MCP server via the standard header:
+In this model, the **agent obtains a Microsoft Graph access token** (for example using MSAL) and passes it to the MCP server via an AgentCore Runtime custom header:
 
-- `Authorization: Bearer <graph_access_token>`
+- `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization: Bearer <graph_access_token>`
 
 The server uses that token directly to call Microsoft Graph; it does **not** accept client secrets and does **not** perform token acquisition/refresh.
 
@@ -62,7 +62,7 @@ This makes the server suitable for horizontal scaling without sticky sessions.
 
 `extract_request_auth_from_headers()` reads both token and shared-mailbox selector from HTTP headers (via FastMCP’s `get_http_headers()`):
 
-- **Graph token** from `authorization` (expects `Bearer ...`)
+- **Graph token** from `x-amzn-bedrock-agentcore-runtime-custom-ms365-authorization` (expects `Bearer ...` but also accepts raw token)
 - **Shared mailbox selector** from:
   - `x-amzn-bedrock-agentcore-runtime-custom-ms365-useridentifier`
   - which corresponds to the original header name `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier`
@@ -95,7 +95,7 @@ It returns:
 `get_client(access_token=None, user_identifier=None, cloud_type=None)` merges values in this priority:
 
 - **access_token**:
-  - tool parameter → `Authorization` header
+  - tool parameter → `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization` header
 - **user_identifier**:
   - tool parameter → custom header → `MS365_USER_IDENTIFIER` env var
 

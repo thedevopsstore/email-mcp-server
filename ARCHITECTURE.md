@@ -33,7 +33,7 @@ email-mcp-server/
 ├── ms365_email_mcp_server/
 │   ├── __init__.py
 │   ├── server.py              # MSAL client-credentials implementation (legacy/default entrypoint)
-│   └── server_token_only.py   # Token-only implementation (Authorization pass-through)
+│   └── server_token_only.py   # Token-only implementation (custom header pass-through)
 ├── ARCHITECTURE.md
 ├── AUTHENTICATION_FLOW.md
 ├── MULTI_AGENT_SETUP.md
@@ -47,8 +47,8 @@ email-mcp-server/
 
 ### 4.1 What the agent sends
 
-- **Graph token**: via standard header
-  - `Authorization: Bearer <graph_access_token>`
+- **Graph token**: via AgentCore custom header
+  - `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization: Bearer <graph_access_token>`
 - **Shared mailbox selector (optional)**: via custom header
   - `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier: <UPN or Graph user id>`
 
@@ -56,7 +56,7 @@ email-mcp-server/
 
 AgentCore only forwards selected headers to the runtime. Ensure your runtime is configured with:
 
-- `Authorization`
+- `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization`
 - `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-UserIdentifier`
 
 The allowlist supports `Authorization` and custom headers prefixed with `X-Amzn-Bedrock-AgentCore-Runtime-Custom-*` (see AWS docs: [RequestHeaderConfiguration](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_RequestHeaderConfiguration.html)).
@@ -64,7 +64,7 @@ The allowlist supports `Authorization` and custom headers prefixed with `X-Amzn-
 ### 4.3 What the server does
 
 `server_token_only.py`:
-- extracts the token from `Authorization`
+- extracts the token from `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Ms365-Authorization`
 - extracts `user_identifier` from the custom header (or tool arg / env var)
 - calls Microsoft Graph with `Authorization: Bearer <token>`
 
@@ -79,7 +79,7 @@ The allowlist supports `Authorization` and custom headers prefixed with `X-Amzn-
 ### 5.2 Header extraction
 
 `extract_request_auth_from_headers()` reads both values in one pass:
-- token from `authorization`
+- token from `x-amzn-bedrock-agentcore-runtime-custom-ms365-authorization`
 - shared mailbox from `x-amzn-bedrock-agentcore-runtime-custom-ms365-useridentifier`
 
 ### 5.3 Client creation
